@@ -8,854 +8,548 @@
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="/favicon.ico" type="image/x-icon" />
     <meta name="theme-color" content="#000000" />
-    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@300;400;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
     <style>
+        /* ==================================================================
+           JARVIS boot console. One palette, defined once: green on black,
+           with amber and red reserved for what needs attention. Glow is a
+           scale (sm / md / lg), applied to what is live -- the core, the
+           running phase, the progress -- never to static text.
+           ================================================================== */
         :root {
             --jarvis-green: #00ff41;
             --jarvis-green-dark: #00aa2e;
             --jarvis-green-glow: rgba(0, 255, 65, 0.5);
-            --jarvis-orange: #ff8c00;
-            --jarvis-red: #ff4444;
+            --jarvis-orange: #ffb020;
+            --jarvis-red: #ff4d4d;
+
+            --g-100: rgba(0, 255, 65, 0.04);
+            --g-200: rgba(0, 255, 65, 0.08);
+            --g-300: rgba(0, 255, 65, 0.16);
+            --g-400: rgba(0, 255, 65, 0.32);
+            --g-text: #b8ffcb;              /* body text: green-tinted white */
+            --g-muted: rgba(184, 255, 203, 0.55);
+            --g-faint: rgba(184, 255, 203, 0.32);
+
+            --glow-sm: 0 0 6px rgba(0, 255, 65, 0.55);
+            --glow-md: 0 0 14px rgba(0, 255, 65, 0.45), 0 0 2px rgba(0, 255, 65, 0.9);
+            --glow-lg: 0 0 40px rgba(0, 255, 65, 0.35), 0 0 12px rgba(0, 255, 65, 0.6);
+            --text-glow: 0 0 18px rgba(0, 255, 65, 0.55), 0 0 4px rgba(0, 255, 65, 0.8);
+
+            --surface: rgba(2, 14, 6, 0.72);
+            --surface-edge: rgba(0, 255, 65, 0.18);
+            --radius: 4px;
+            --gap: clamp(12px, 1.6vw, 22px);
+
+            --font-display: 'Orbitron', 'Inter', sans-serif;
+            --font-ui: 'Inter', 'Segoe UI', system-ui, sans-serif;
+            --font-mono: 'JetBrains Mono', 'Cascadia Mono', Consolas, monospace;
         }
 
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        html {
-            background: #000;
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html { height: 100%; }
 
         body {
-            background: #000;
-            color: var(--jarvis-green);
-            font-family: 'Rajdhani', sans-serif;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 100vh;
-            overflow: hidden;
-            position: relative;
-            margin: 0;
-            padding: 0;
+            min-height: 100%;
+            background:
+                radial-gradient(ellipse 80% 60% at 30% 40%, rgba(0, 255, 65, 0.06), transparent 70%),
+                radial-gradient(ellipse at center, #020a04 0%, #000 75%);
+            color: var(--g-text);
+            font-family: var(--font-ui);
+            font-size: 14px;
+            line-height: 1.45;
+            -webkit-font-smoothing: antialiased;
+            overflow-x: hidden;
         }
 
-        /* Prevent white flash during page transitions */
+        /* A fine HUD grid under everything, fading toward the edges. */
         body::before {
             content: '';
             position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: #000;
-            z-index: -1;
+            inset: 0;
+            background-image:
+                linear-gradient(var(--g-100) 1px, transparent 1px),
+                linear-gradient(90deg, var(--g-100) 1px, transparent 1px);
+            background-size: 48px 48px;
+            mask-image: radial-gradient(ellipse at center, #000 30%, transparent 80%);
+            pointer-events: none;
+            z-index: 0;
         }
 
-        /* Matrix Rain Background - deepest layer */
+        /* Ambient layers: present, never competing with the data. */
         .matrix-canvas {
             position: fixed;
-            top: 0;
-            left: 0;
+            inset: 0;
             width: 100%;
             height: 100%;
-            z-index: 0;
+            opacity: 0.08;
             pointer-events: none;
-            opacity: 0.2;
+            z-index: 0;
         }
-
-        /* Particle background - above matrix */
-        .particles-bg {
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            z-index: 1;
-            opacity: 0.3;
-        }
-
+        .particles-bg { position: fixed; inset: 0; pointer-events: none; z-index: 0; overflow: hidden; }
         .particle {
             position: absolute;
-            background: var(--jarvis-green);
+            width: 2px;
+            height: 2px;
             border-radius: 50%;
+            background: var(--jarvis-green);
+            box-shadow: var(--glow-sm);
+            opacity: 0.5;
             animation: float linear infinite;
         }
-
         @keyframes float {
-            0% {
-                transform: translateY(100vh) translateX(0);
-                opacity: 0;
-            }
-            10% {
-                opacity: 1;
-            }
-            90% {
-                opacity: 1;
-            }
-            100% {
-                transform: translateY(-100vh) translateX(50px);
-                opacity: 0;
-            }
+            from { transform: translateY(0); opacity: 0; }
+            15%  { opacity: 0.5; }
+            85%  { opacity: 0.5; }
+            to   { transform: translateY(-100vh); opacity: 0; }
         }
-
-        /* v225.0: CRT Scan Line Overlay */
         .scan-lines {
             position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            z-index: 2;
+            inset: 0;
+            background: repeating-linear-gradient(0deg, rgba(0, 0, 0, 0.18) 0 1px, transparent 1px 3px);
             pointer-events: none;
-            background: repeating-linear-gradient(
-                0deg,
-                transparent,
-                transparent 2px,
-                rgba(0, 0, 0, 0.03) 2px,
-                rgba(0, 0, 0, 0.03) 4px
-            );
-            animation: scanMove 8s linear infinite;
+            z-index: 50;
         }
-
-        @keyframes scanMove {
-            0% { background-position: 0 0; }
-            100% { background-position: 0 8px; }
+        .scan-lines::after {
+            content: '';
+            position: absolute;
+            left: 0;
+            right: 0;
+            height: 18vh;
+            background: linear-gradient(transparent, rgba(0, 255, 65, 0.035), transparent);
+            animation: scanMove 9s linear infinite;
         }
+        @keyframes scanMove { from { top: -18vh; } to { top: 100vh; } }
 
-        /* Main container - above all background layers */
+        /* Frame: precise corner brackets. */
+        .hud-frame { position: fixed; inset: 14px; pointer-events: none; z-index: 40; }
+        .hud-corner { position: absolute; width: 28px; height: 28px; border-color: var(--g-400); border-style: solid; }
+        .hud-corner.top-left { top: 0; left: 0; border-width: 1px 0 0 1px; }
+        .hud-corner.top-right { top: 0; right: 0; border-width: 1px 1px 0 0; }
+        .hud-corner.bottom-left { bottom: 0; left: 0; border-width: 0 0 1px 1px; }
+        .hud-corner.bottom-right { bottom: 0; right: 0; border-width: 0 1px 1px 0; }
+
+        /* ==================================================================
+           Layout: header across; the core above the event log, beside the
+           boot sequence and the checklist -- one screen at desktop sizes.
+           One column on narrow screens, in reading order.
+           ================================================================== */
         .loading-container {
-            text-align: center;
-            z-index: 10;
             position: relative;
-            max-width: min(900px, 90vw);
-            width: 90%;
-            padding: clamp(1rem, 4vh, 2.5rem);
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            gap: clamp(0.5rem, 2vh, 1.5rem);
+            z-index: 10;
+            max-width: 1320px;
             min-height: 100vh;
-            box-sizing: border-box;
+            margin: 0 auto;
+            padding: calc(var(--gap) * 1.6) calc(var(--gap) * 2.2);
+            display: grid;
+            grid-template-columns: minmax(0, 1.05fr) minmax(320px, 0.95fr);
+            grid-template-areas:
+                "header  header"
+                "core    side"
+                "log     side"
+                "error   error";
+            grid-template-rows: auto auto 1fr auto;
+            align-content: start;
+            gap: var(--gap);
+            animation: consoleIn 0.6s ease-out both;
         }
+        @keyframes consoleIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 
-        /* v225.0: HUD Corner Brackets */
-        .hud-frame {
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            pointer-events: none;
-            z-index: 3;
+        /* Panels: a translucent surface with a hairline edge and notched corners. */
+        .panel {
+            position: relative;
+            background: var(--surface);
+            border: 1px solid var(--surface-edge);
+            border-radius: var(--radius);
+            backdrop-filter: blur(6px);
+            box-shadow: inset 0 1px 0 var(--g-200), 0 0 0 1px rgba(0, 0, 0, 0.6);
         }
-
-        .hud-corner {
-            position: absolute;
-            width: 50px;
-            height: 50px;
-            border-color: rgba(0, 255, 65, 0.25);
-            border-style: solid;
-        }
-
-        .hud-corner.top-left {
-            top: 15px;
-            left: 15px;
-            border-width: 2px 0 0 2px;
-        }
-
-        .hud-corner.top-right {
-            top: 15px;
-            right: 15px;
-            border-width: 2px 2px 0 0;
-        }
-
-        .hud-corner.bottom-left {
-            bottom: 15px;
-            left: 15px;
-            border-width: 0 0 2px 2px;
-        }
-
-        .hud-corner.bottom-right {
-            bottom: 15px;
-            right: 15px;
-            border-width: 0 2px 2px 0;
-        }
-
-        .hud-corner::after {
+        .panel::before, .panel::after {
             content: '';
             position: absolute;
-            background: var(--jarvis-green);
-            border-radius: 50%;
-            width: 4px;
-            height: 4px;
-            opacity: 0.5;
+            width: 10px;
+            height: 10px;
+            border: 1px solid var(--jarvis-green);
+            opacity: 0.7;
         }
-
-        .hud-corner.top-left::after { top: -2px; left: -2px; }
-        .hud-corner.top-right::after { top: -2px; right: -2px; }
-        .hud-corner.bottom-left::after { bottom: -2px; left: -2px; }
-        .hud-corner.bottom-right::after { bottom: -2px; right: -2px; }
-
-        /* v225.0: Staggered Entrance Animations */
-        .loading-container > [style*="order"] {
-            opacity: 0;
-            animation: fadeSlideIn 0.6s ease forwards;
-        }
-
-        .loading-container > [style*="order: 1"] { animation-delay: 0.05s; }
-        .loading-container > [style*="order: 2"] { animation-delay: 0.15s; }
-        .loading-container > [style*="order: 3"] { animation-delay: 0.3s; }
-        .loading-container > [style*="order: 4"] { animation-delay: 0.5s; }
-        .loading-container > [style*="order: 5"] { animation-delay: 0.6s; }
-        .loading-container > [style*="order: 6"] { animation-delay: 0.7s; }
-        .loading-container > [style*="order: 7"] { animation-delay: 0.8s; }
-        .loading-container > [style*="order: 8"] { animation-delay: 0.9s; }
-        .loading-container > [style*="order: 9"] { animation-delay: 1.0s; }
-
-        @keyframes fadeSlideIn {
-            from {
-                opacity: 0;
-                transform: translateY(12px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-
-        /* Logo */
-        .jarvis-logo {
-            font-family: 'Orbitron', monospace;
-            font-size: clamp(2.5rem, 8vw, 5rem);
-            font-weight: 900;
-            background: linear-gradient(135deg, var(--jarvis-green) 0%, var(--jarvis-green-dark) 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-            filter: drop-shadow(0 0 30px var(--jarvis-green-glow));
-            animation: pulse 2s ease-in-out infinite;
-            flex-shrink: 0;
-        }
-
-        .subtitle {
-            font-size: clamp(0.9rem, 2vw, 1.3rem);
-            color: var(--jarvis-green-dark);
-            letter-spacing: 0.3em;
-            text-transform: uppercase;
-            opacity: 0.9;
-            flex-shrink: 0;
-        }
-
-        /* Arc Reactor Wrapper */
-        .arc-reactor-wrapper {
-            --reactor-size: clamp(180px, 30vmin, 300px);
-            width: var(--reactor-size);
-            height: var(--reactor-size);
-            position: relative;
+        .panel::before { top: -1px; left: -1px; border-width: 1px 0 0 1px; }
+        .panel::after { bottom: -1px; right: -1px; border-width: 0 1px 1px 0; }
+        .panel-header {
             display: flex;
             align-items: center;
-            justify-content: center;
-            flex-shrink: 0;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--g-200);
+            font-family: var(--font-mono);
+            font-size: 11px;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+            color: var(--g-muted);
         }
+        .panel-header .panel-meta { letter-spacing: 0.04em; text-transform: none; color: var(--g-faint); }
+        .panel-body { padding: 10px 16px 14px; }
 
-        /* v225.0: SVG Circular Progress Ring */
-        .progress-ring {
-            position: absolute;
-            width: 112%;
-            height: 112%;
-            top: -6%;
-            left: -6%;
-            z-index: 1;
-            transform: rotate(-90deg);
-            pointer-events: none;
+        /* Header */
+        .console-header {
+            grid-area: header;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: var(--gap);
+            padding-bottom: var(--gap);
+            border-bottom: 1px solid var(--g-200);
         }
-
-        .progress-ring-bg {
-            fill: none;
-            stroke: rgba(0, 255, 65, 0.06);
-            stroke-width: 2.5;
-        }
-
-        .progress-ring-fill {
-            fill: none;
-            stroke: var(--jarvis-green);
-            stroke-width: 2.5;
-            stroke-linecap: round;
-            stroke-dasharray: 597;
-            stroke-dashoffset: 597;
-            transition: stroke-dashoffset 0.8s cubic-bezier(0.4, 0, 0.2, 1);
-            filter: drop-shadow(0 0 6px var(--jarvis-green-glow));
-        }
-
-        /* Secondary tick marks around the ring */
-        .progress-ring-ticks {
-            fill: none;
-            stroke: rgba(0, 255, 65, 0.12);
-            stroke-width: 0.5;
-            stroke-dasharray: 2 12.4;
-        }
-
-        /* Arc Reactor */
-        .arc-reactor {
-            width: 100%;
-            height: 100%;
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            transform-origin: center center;
-            animation: reactorFloat 4s ease-in-out infinite;
-        }
-
-        @keyframes reactorFloat {
-            0%, 100% {
-                transform: translate(-50%, -50%) translateY(0px);
-            }
-            50% {
-                transform: translate(-50%, -50%) translateY(-10px);
-            }
-        }
-
-        .reactor-ring {
-            position: absolute;
-            border: clamp(2px, 0.4vmin, 4px) solid;
-            border-radius: 50%;
-            animation: rotate linear infinite;
-            inset: 0;
-            margin: auto;
-        }
-
-        .reactor-ring:nth-child(1) {
-            width: 100%;
-            height: 100%;
-            border-color: var(--jarvis-green) transparent transparent transparent;
-            animation: rotate 3s linear infinite, ringPulse1 2s ease-in-out infinite;
-            box-shadow:
-                0 0 20px var(--jarvis-green-glow),
-                inset 0 0 20px rgba(0, 255, 65, 0.1);
-        }
-
-        .reactor-ring:nth-child(2) {
-            width: 73%;
-            height: 73%;
-            border-color: transparent var(--jarvis-green-dark) transparent transparent;
-            animation: rotate 2s linear infinite reverse, ringPulse2 2.5s ease-in-out infinite;
-            box-shadow:
-                0 0 15px var(--jarvis-green-glow),
-                inset 0 0 15px rgba(0, 255, 65, 0.1);
-        }
-
-        .reactor-ring:nth-child(3) {
-            width: 47%;
-            height: 47%;
-            border-color: transparent transparent var(--jarvis-green) transparent;
-            animation: rotate 1.5s linear infinite, ringPulse3 3s ease-in-out infinite;
-            box-shadow:
-                0 0 10px var(--jarvis-green-glow),
-                inset 0 0 10px rgba(0, 255, 65, 0.1);
-        }
-
-        @keyframes ringPulse1 {
-            0%, 100% {
-                opacity: 1;
-                filter: drop-shadow(0 0 20px var(--jarvis-green));
-            }
-            50% {
-                opacity: 0.7;
-                filter: drop-shadow(0 0 30px var(--jarvis-green));
-            }
-        }
-
-        @keyframes ringPulse2 {
-            0%, 100% {
-                opacity: 0.8;
-                filter: drop-shadow(0 0 15px var(--jarvis-green-dark));
-            }
-            50% {
-                opacity: 1;
-                filter: drop-shadow(0 0 25px var(--jarvis-green-dark));
-            }
-        }
-
-        @keyframes ringPulse3 {
-            0%, 100% {
-                opacity: 0.9;
-                filter: drop-shadow(0 0 10px var(--jarvis-green));
-            }
-            50% {
-                opacity: 1;
-                filter: drop-shadow(0 0 20px var(--jarvis-green));
-            }
-        }
-
-        .reactor-core {
-            position: absolute;
-            width: 27%;
-            height: 27%;
-            inset: 0;
-            margin: auto;
-            background: radial-gradient(circle,
-                var(--jarvis-green) 0%,
-                var(--jarvis-green) 30%,
-                var(--jarvis-green-dark) 60%,
-                rgba(0, 170, 46, 0.5) 85%,
-                transparent 100%);
-            border-radius: 50%;
-            box-shadow:
-                0 0 30px var(--jarvis-green),
-                0 0 60px var(--jarvis-green),
-                0 0 90px var(--jarvis-green-dark),
-                0 0 120px var(--jarvis-green-glow),
-                inset 0 0 30px var(--jarvis-green);
-            animation: corePulse 1.5s ease-in-out infinite;
-            z-index: 10;
-        }
-
-        .reactor-core::before {
-            content: '';
-            position: absolute;
-            width: 62%;
-            height: 62%;
-            inset: 0;
-            margin: auto;
-            background: var(--jarvis-green);
-            border-radius: 50%;
-            box-shadow:
-                0 0 25px var(--jarvis-green),
-                0 0 50px rgba(0, 255, 65, 0.8),
-                inset 0 0 15px rgba(255, 255, 255, 0.5);
-            animation: coreGlow 2s ease-in-out infinite;
-        }
-
-        @keyframes coreGlow {
-            0%, 100% {
-                box-shadow:
-                    0 0 25px var(--jarvis-green),
-                    0 0 50px rgba(0, 255, 65, 0.8),
-                    inset 0 0 15px rgba(255, 255, 255, 0.5);
-            }
-            50% {
-                box-shadow:
-                    0 0 40px var(--jarvis-green),
-                    0 0 80px rgba(0, 255, 65, 1),
-                    inset 0 0 25px rgba(255, 255, 255, 0.8);
-            }
-        }
-
-        @keyframes rotate {
-            from { transform: rotate(0deg); }
-            to { transform: rotate(360deg); }
-        }
-
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.8; }
-        }
-
-        @keyframes corePulse {
-            0%, 100% {
-                transform: scale(1);
-                box-shadow: 0 0 30px var(--jarvis-green), 0 0 60px var(--jarvis-green-dark);
-            }
-            50% {
-                transform: scale(1.15);
-                box-shadow: 0 0 50px var(--jarvis-green), 0 0 90px var(--jarvis-green-dark);
-            }
-        }
-
-        /* Progress percentage */
-        .progress-percentage {
-            font-size: clamp(1.8rem, 5vw, 3rem);
+        .brand { display: flex; align-items: baseline; gap: 18px; flex-wrap: wrap; }
+        .jarvis-logo {
+            font-family: var(--font-display);
             font-weight: 700;
+            font-size: clamp(26px, 3.2vw, 40px);
+            letter-spacing: 0.22em;
             color: var(--jarvis-green);
-            font-family: 'Orbitron', monospace;
-            text-shadow: 0 0 20px var(--jarvis-green-glow);
-            transition: all 0.3s ease;
-            flex-shrink: 0;
+            text-shadow: var(--text-glow);
+        }
+        .brand-tagline {
+            font-family: var(--font-mono);
+            font-size: 11px;
+            letter-spacing: 0.18em;
+            text-transform: uppercase;
+            color: var(--g-faint);
+        }
+        .header-status { display: flex; align-items: center; gap: 14px; }
+        .subtitle {
+            font-family: var(--font-mono);
+            font-size: 11px;
+            letter-spacing: 0.2em;
+            text-transform: uppercase;
+            color: var(--jarvis-green);
+            padding: 6px 12px;
+            border: 1px solid var(--g-400);
+            border-radius: 999px;
+            background: var(--g-100);
+            box-shadow: var(--glow-sm);
         }
 
-        /* v225.0: ETA Display */
-        .eta-display {
-            font-family: 'Orbitron', monospace;
-            font-size: clamp(0.75rem, 1.5vw, 0.9rem);
-            color: var(--jarvis-green-dark);
-            letter-spacing: 0.12em;
-            opacity: 0.85;
+        /* The state chip takes its colour from its state (data-state, the
+           same vocabulary as the status dot): amber needs attention, red failed. */
+        .subtitle[data-state="warning"], .subtitle[data-state="slow"], .subtitle[data-state="partial"] {
+            color: var(--jarvis-orange);
+            border-color: rgba(255, 176, 32, 0.5);
+            background: rgba(255, 176, 32, 0.06);
+            box-shadow: 0 0 6px rgba(255, 176, 32, 0.4);
+        }
+        .subtitle[data-state="error"] {
+            color: var(--jarvis-red);
+            border-color: rgba(255, 77, 77, 0.55);
+            background: rgba(255, 77, 77, 0.07);
+            box-shadow: 0 0 8px rgba(255, 77, 77, 0.45);
+        }
+
+        /* Connection: the link to the backend, as a status dot. */
+        .connection-status {
             display: flex;
             align-items: center;
             gap: 8px;
-            flex-shrink: 0;
+            font-family: var(--font-mono);
+            font-size: 11px;
+            color: var(--g-muted);
         }
-
-        .eta-label {
-            font-size: 0.65em;
-            text-transform: uppercase;
-            opacity: 0.6;
-            letter-spacing: 0.2em;
+        .toggle-hint { display: none; }
+        .status-indicator {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--g-faint);
         }
-
-        .eta-value {
-            color: var(--jarvis-green);
-            font-weight: 700;
-        }
-
-        .eta-separator {
-            width: 1px;
-            height: 12px;
-            background: rgba(0, 255, 65, 0.2);
-        }
-
-        .eta-confidence {
-            font-size: 0.6em;
-            opacity: 0.5;
-        }
-
-        /* v225.0: Phase Timeline */
-        .phase-timeline {
-            width: 100%;
-            position: relative;
-            padding: 8px 0 28px;
-            flex-shrink: 0;
-            display: flex;
-            justify-content: space-between;
-            align-items: flex-start;
-        }
-
-        .timeline-track-wrapper {
-            position: absolute;
-            top: 14px;
-            left: 4%;
-            right: 4%;
-            height: 2px;
-        }
-
-        .timeline-track {
-            width: 100%;
-            height: 100%;
-            background: rgba(0, 255, 65, 0.1);
-            border-radius: 1px;
-        }
-
-        .timeline-fill {
-            height: 100%;
-            width: 0%;
+        .status-indicator.connected, .status-indicator.loading, .status-indicator.verifying,
+        .status-indicator.finalizing, .status-indicator.ready {
             background: var(--jarvis-green);
-            border-radius: 1px;
-            transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1);
-            box-shadow: 0 0 8px var(--jarvis-green-glow);
+            box-shadow: var(--glow-sm);
         }
+        .status-indicator.connecting { background: var(--jarvis-green); animation: blink 1.2s ease-in-out infinite; }
+        .status-indicator.warning { background: var(--jarvis-orange); box-shadow: 0 0 8px rgba(255, 176, 32, 0.6); }
+        .status-indicator.error, .status-indicator.disconnected {
+            background: var(--jarvis-red);
+            box-shadow: 0 0 8px rgba(255, 77, 77, 0.6);
+        }
+        @keyframes blink { 50% { opacity: 0.25; } }
 
-        .timeline-dot-wrapper {
+        /* ==================================================================
+           The core: reactor and progress ring, the one percentage, the
+           estimate, the bar, and what JARVIS is doing now.
+           ================================================================== */
+        .core-panel {
+            grid-area: core;
             display: flex;
             flex-direction: column;
             align-items: center;
-            gap: 6px;
-            z-index: 1;
-            flex: 1;
-            max-width: 60px;
+            justify-content: center;
+            gap: 18px;
+            padding: var(--gap);
         }
-
-        .timeline-dot {
-            width: 10px;
-            height: 10px;
-            border-radius: 50%;
-            border: 2px solid rgba(0, 255, 65, 0.2);
-            background: rgba(0, 0, 0, 0.8);
-            transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
-            flex-shrink: 0;
-        }
-
-        .timeline-dot.active {
-            border-color: var(--jarvis-green);
-            background: rgba(0, 255, 65, 0.15);
-            box-shadow: 0 0 10px var(--jarvis-green-glow), 0 0 20px rgba(0, 255, 65, 0.15);
-            animation: dotPulse 1.5s ease-in-out infinite;
-        }
-
-        .timeline-dot.completed {
-            border-color: var(--jarvis-green);
-            background: var(--jarvis-green);
-            box-shadow: 0 0 6px var(--jarvis-green-glow);
-        }
-
-        @keyframes dotPulse {
-            0%, 100% {
-                box-shadow: 0 0 10px var(--jarvis-green-glow), 0 0 20px rgba(0, 255, 65, 0.15);
-                transform: scale(1);
-            }
-            50% {
-                box-shadow: 0 0 16px var(--jarvis-green-glow), 0 0 30px rgba(0, 255, 65, 0.25);
-                transform: scale(1.2);
-            }
-        }
-
-        .timeline-label {
-            font-size: clamp(0.5rem, 1vw, 0.6rem);
-            color: rgba(0, 255, 65, 0.35);
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            font-weight: 600;
-            text-align: center;
-            line-height: 1.2;
-            transition: color 0.3s;
-            white-space: nowrap;
-        }
-
-        .timeline-dot-wrapper.active .timeline-label {
-            color: var(--jarvis-green);
-        }
-
-        .timeline-dot-wrapper.completed .timeline-label {
-            color: rgba(0, 255, 65, 0.6);
-        }
-
-        @media (max-width: 600px) {
-            .timeline-label { font-size: 0.45rem; }
-            .timeline-dot { width: 8px; height: 8px; }
-        }
-
-        /* Progress bar - v225.0: Refined thinner style */
-        .progress-container {
-            width: 100%;
-            height: 8px;
-            background: rgba(0, 255, 65, 0.06);
-            border: 1px solid rgba(0, 255, 65, 0.25);
-            border-radius: 4px;
-            overflow: hidden;
+        .arc-reactor-wrapper {
             position: relative;
-            box-shadow: 0 0 10px rgba(0, 255, 65, 0.08);
-            flex-shrink: 0;
-        }
-
-        .progress-bar {
-            height: 100%;
-            background: linear-gradient(90deg,
-                var(--jarvis-green-dark) 0%,
-                var(--jarvis-green) 50%,
-                var(--jarvis-green-dark) 100%);
-            background-size: 200% 100%;
-            animation: shimmer 3s infinite linear;
-            width: 0%;
-            transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1);
-            position: relative;
-            border-radius: 3px;
-            box-shadow: 0 0 8px var(--jarvis-green-glow);
-        }
-
-        .progress-bar::after {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: linear-gradient(90deg,
-                transparent 0%,
-                rgba(255, 255, 255, 0.3) 50%,
-                transparent 100%);
-            animation: slide 2s infinite;
-        }
-
-        @keyframes shimmer {
-            0% { background-position: 200% 0; }
-            100% { background-position: -200% 0; }
-        }
-
-        @keyframes slide {
-            0% { transform: translateX(-100%); }
-            100% { transform: translateX(100%); }
-        }
-
-        /* Status message */
-        .status-message {
-            font-size: clamp(0.9rem, 2vw, 1.2rem);
-            color: #fff;
-            min-height: clamp(24px, 4vh, 40px);
-            text-shadow: 0 0 10px var(--jarvis-green-glow);
-            font-weight: 500;
-            letter-spacing: 0.05em;
-            flex-shrink: 0;
-        }
-
-        /* Stage indicators */
-        .stages-container {
+            width: clamp(180px, 22vw, 260px);
+            aspect-ratio: 1;
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(clamp(100px, 15vw, 140px), 1fr));
-            gap: clamp(8px, 1.5vw, 15px);
-            width: 100%;
-            flex-shrink: 0;
+            place-items: center;
         }
-
-        .stage-item {
-            padding: clamp(12px, 2vw, 20px) clamp(10px, 1.5vw, 15px);
-            background: rgba(0, 255, 65, 0.05);
-            border: 1px solid rgba(0, 255, 65, 0.25);
-            border-radius: clamp(8px, 1.5vw, 12px);
-            transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
-            position: relative;
-            overflow: hidden;
-        }
-
-        .stage-item::before {
-            content: '';
+        .progress-ring {
             position: absolute;
-            top: 0;
-            left: -100%;
+            inset: 0;
             width: 100%;
             height: 100%;
-            background: linear-gradient(90deg, transparent, rgba(0, 255, 65, 0.2), transparent);
-            transition: left 0.6s;
+            transform: rotate(-90deg);
+            overflow: visible;
         }
-
-        .stage-item.active {
-            background: rgba(0, 255, 65, 0.15);
-            border-color: var(--jarvis-green);
-            box-shadow: 0 0 20px var(--jarvis-green-glow);
-            transform: scale(1.05);
+        .progress-ring circle { fill: none; }
+        .progress-ring-ticks {
+            stroke: var(--g-300);
+            stroke-width: 6;
+            stroke-dasharray: 1 5.2;
         }
-
-        .stage-item.active::before {
-            left: 100%;
+        .progress-ring-bg { stroke: var(--g-200); stroke-width: 2; }
+        .progress-ring-fill {
+            stroke: var(--jarvis-green);
+            stroke-width: 3;
+            stroke-linecap: round;
+            /* No transition: the page eases progress itself (loading-manager.js);
+               a second, CSS easing restarted on every frame and lagged the number. */
+            /* The glow grows with progress (--progress, 0..1, set by the page). */
+            filter: drop-shadow(0 0 calc(4px + var(--progress, 0) * 10px) rgba(0, 255, 65, 0.85));
         }
-
-        .stage-item.completed {
-            background: rgba(0, 255, 65, 0.1);
-            border-color: var(--jarvis-green-dark);
+        .arc-reactor { position: relative; width: 72%; aspect-ratio: 1; }
+        .reactor-ring {
+            position: absolute;
+            border-radius: 50%;
+            border: 1px solid transparent;
         }
-
-        .stage-item.failed {
-            background: rgba(255, 68, 68, 0.1);
-            border-color: var(--jarvis-red);
+        .reactor-ring:nth-child(1) {
+            inset: 0;
+            border-color: var(--g-400) transparent var(--g-300) transparent;
+            animation: rotate 14s linear infinite;
         }
-
-        .stage-icon {
-            font-size: clamp(1.5rem, 4vw, 2.5rem);
-            margin-bottom: clamp(6px, 1.5vh, 12px);
-            filter: drop-shadow(0 0 5px var(--jarvis-green-glow));
+        .reactor-ring:nth-child(2) {
+            inset: 13%;
+            border: 2px solid transparent;
+            border-top-color: var(--jarvis-green);
+            border-right-color: var(--g-300);
+            box-shadow: var(--glow-sm);
+            animation: rotate 7s linear infinite reverse;
         }
+        .reactor-ring:nth-child(3) {
+            inset: 26%;
+            border-color: var(--g-300);
+            border-left-color: var(--jarvis-green);
+            animation: rotate 4.5s linear infinite;
+        }
+        .reactor-core {
+            position: absolute;
+            inset: 37%;
+            border-radius: 50%;
+            background: radial-gradient(circle, #eafff0 0%, var(--jarvis-green) 35%, rgba(0, 170, 46, 0.35) 70%, transparent 72%);
+            box-shadow: var(--glow-lg), inset 0 0 12px rgba(255, 255, 255, 0.5);
+            animation: coreGlow 3s ease-in-out infinite;
+        }
+        @keyframes coreGlow {
+            50% { box-shadow: 0 0 60px rgba(0, 255, 65, 0.45), 0 0 18px rgba(0, 255, 65, 0.75), inset 0 0 14px rgba(255, 255, 255, 0.6); }
+        }
+        @keyframes rotate { to { transform: rotate(360deg); } }
 
-        .stage-label {
-            font-size: clamp(0.7rem, 1.5vw, 0.95rem);
-            text-transform: uppercase;
+        .progress-percentage {
+            font-family: var(--font-mono);
             font-weight: 600;
-            letter-spacing: 0.1em;
+            font-size: clamp(38px, 4.4vw, 56px);
+            line-height: 1;
+            font-variant-numeric: tabular-nums;
+            color: var(--jarvis-green);
+            text-shadow: var(--text-glow);
         }
-
-        .stage-sublabel {
-            font-size: clamp(0.6rem, 1.2vw, 0.75rem);
-            color: var(--jarvis-green-dark);
-            margin-top: clamp(3px, 0.5vh, 5px);
-            opacity: 0;
-            transition: opacity 0.3s;
-        }
-
-        .stage-item.active .stage-sublabel,
-        .stage-item.completed .stage-sublabel {
-            opacity: 1;
-        }
-
-        /* Connection status */
-        .connection-status {
-            position: fixed;
-            top: clamp(10px, 2vw, 20px);
-            right: clamp(10px, 2vw, 20px);
-            padding: clamp(6px, 1.5vw, 10px) clamp(12px, 2.5vw, 20px);
-            background: rgba(0, 0, 0, 0.7);
-            border: 1px solid rgba(0, 255, 65, 0.3);
-            border-radius: clamp(6px, 1vw, 8px);
-            font-size: clamp(0.7rem, 1.5vw, 0.9rem);
+        .eta-display {
             display: flex;
             align-items: center;
-            gap: clamp(6px, 1.5vw, 10px);
-            z-index: 100;
+            gap: 8px;
+            font-family: var(--font-mono);
+            font-size: 12px;
+            color: var(--g-muted);
+        }
+        .eta-label { letter-spacing: 0.16em; color: var(--g-faint); }
+        .eta-value { color: var(--g-text); font-variant-numeric: tabular-nums; }
+        .eta-separator { color: var(--g-faint); }
+        .eta-confidence { color: var(--g-faint); }
+
+        .progress-container {
+            width: min(100%, 420px);
+            height: 3px;
+            background: var(--g-200);
+            border-radius: 2px;
+            overflow: hidden;
+        }
+        .progress-bar {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, var(--jarvis-green-dark), var(--jarvis-green));
+            box-shadow: var(--glow-md);
+            /* Eased by the page, like the ring (no CSS transition). */
+        }
+        .status-message {
+            max-width: 46ch;
+            min-height: 2.9em;
+            text-align: center;
+            font-size: 14px;
+            color: var(--g-text);
         }
 
-        .status-indicator {
-            width: 10px;
-            height: 10px;
+        /* ==================================================================
+           Boot sequence: the phases, as rows (loading-manager.js
+           renderBootTimeline builds them from the supervisor's timeline).
+           ================================================================== */
+        .side-panels { grid-area: side; display: flex; flex-direction: column; gap: var(--gap); min-width: 0; }
+        .phase-timeline { position: relative; display: flex; flex-direction: column; padding: 6px 0 10px; }
+        .timeline-track-wrapper { position: absolute; left: 25px; top: 18px; bottom: 22px; width: 1px; }
+        .timeline-track { width: 100%; height: 100%; background: var(--g-200); }
+        .timeline-fill {
+            width: 100%;
+            height: 0%;
+            background: var(--jarvis-green);
+            box-shadow: var(--glow-sm);
+            transition: height 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        .phase-timeline:not([data-phases]) .timeline-track-wrapper { display: none; }
+        .timeline-dot-wrapper {
+            position: relative;
+            z-index: 1;
+            display: grid;
+            grid-template-columns: 20px 1fr auto;
+            align-items: center;
+            gap: 12px;
+            padding: 6px 16px;
+            color: var(--g-faint);
+            transition: color 0.3s, background 0.3s;
+        }
+        .timeline-dot {
+            width: 9px;
+            height: 9px;
+            justify-self: center;
             border-radius: 50%;
-            animation: blink 1.5s infinite;
+            border: 1px solid var(--g-400);
+            background: #000;
+            transition: all 0.3s;
         }
-
-        .status-indicator.connecting {
-            background: var(--jarvis-orange);
-        }
-
-        .status-indicator.connected {
-            background: var(--jarvis-green);
-            animation: none;
-        }
-
-        .status-indicator.disconnected {
-            background: var(--jarvis-red);
-        }
-
-        /* New status states for loading progress */
-        .status-indicator.starting,
-        .status-indicator.loading {
-            background: var(--jarvis-orange);
-        }
-
-        .status-indicator.initializing,
-        .status-indicator.verifying {
-            background: var(--jarvis-blue, #00a8ff);
-            animation: blink 1s infinite;
-        }
-
-        .status-indicator.finalizing {
-            background: var(--jarvis-green);
-            animation: blink 0.5s infinite;
-        }
-
-        .status-indicator.ready {
-            background: var(--jarvis-green);
-            animation: none;
-            box-shadow: 0 0 10px var(--jarvis-green);
-        }
-
-        .status-indicator.waiting,
-        .status-indicator.warning {
-            background: var(--jarvis-orange);
-            animation: blink 0.8s infinite;
-        }
-
-        .status-indicator.error {
-            background: var(--jarvis-red);
-            animation: none;
-        }
-
-        /* Connection status toggle hint */
-        .connection-status {
-            cursor: pointer;
-            user-select: none;
-        }
-
-        .connection-status:hover {
+        .timeline-label { font-size: 13px; }
+        .timeline-meta { font-family: var(--font-mono); font-size: 11px; font-variant-numeric: tabular-nums; }
+        .timeline-dot-wrapper.completed { color: var(--g-text); }
+        .timeline-dot-wrapper.completed .timeline-meta { color: var(--g-muted); }
+        .timeline-dot-wrapper.completed .timeline-dot { background: var(--jarvis-green); border-color: var(--jarvis-green); }
+        .timeline-dot-wrapper.active { color: var(--jarvis-green); background: linear-gradient(90deg, var(--g-200), transparent); }
+        .timeline-dot-wrapper.active .timeline-label { text-shadow: 0 0 10px rgba(0, 255, 65, 0.5); }
+        .timeline-dot-wrapper.active .timeline-dot {
             border-color: var(--jarvis-green);
-            background: rgba(0, 255, 65, 0.05);
+            background: var(--g-300);
+            box-shadow: var(--glow-md);
+            animation: dotPulse 1.6s ease-in-out infinite;
+        }
+        @keyframes dotPulse { 50% { transform: scale(1.35); box-shadow: var(--glow-lg); } }
+        .phase-timeline:not([data-phases])::after {
+            content: 'Waiting for the supervisor';
+            padding: 8px 16px;
+            color: var(--g-faint);
+            font-family: var(--font-mono);
+            font-size: 12px;
         }
 
-        .toggle-hint {
-            font-size: 0.7rem;
-            color: rgba(0, 255, 65, 0.5);
-            margin-left: 6px;
-            transition: transform 0.3s ease;
+        /* Pre-flight checklist (loading-manager.js renderChecklist). */
+        .checklist-items { list-style: none; }
+        .checklist-item {
+            display: grid;
+            grid-template-columns: 64px 1fr;
+            gap: 2px 12px;
+            padding: 8px 16px;
+            border-top: 1px solid var(--g-100);
         }
-
-        .connection-status.panel-hidden .toggle-hint {
-            transform: rotate(180deg);
+        .checklist-item:first-child { border-top: 0; }
+        .checklist-title { font-size: 13px; color: var(--g-text); }
+        .checklist-detail, .checklist-remedy {
+            grid-column: 2;
+            font-family: var(--font-mono);
+            font-size: 11px;
+            color: var(--g-muted);
+            overflow-wrap: anywhere;
         }
-
-        @keyframes blink {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.3; }
+        .checklist-remedy { color: var(--jarvis-orange); }
+        .chip {
+            align-self: start;
+            justify-self: start;
+            padding: 2px 8px;
+            border-radius: 999px;
+            border: 1px solid currentColor;
+            font-family: var(--font-mono);
+            font-size: 10px;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
         }
+        .chip.go { color: var(--jarvis-green); box-shadow: var(--glow-sm); }
+        .chip.limited { color: var(--jarvis-orange); }
+        .chip.no_go { color: var(--jarvis-red); }
+        .chip.skipped { color: var(--g-faint); }
+        .chip.ready { color: var(--jarvis-green); }
+        .chip.not_ready { color: var(--jarvis-red); }
 
-        /* Details panel */
+        /* ==================================================================
+           Event log: what each part of JARVIS reported, as it happened.
+           ================================================================== */
+        .log-panel { grid-area: log; display: flex; flex-direction: column; min-height: 0; }
+        .operations-log { display: flex; flex-direction: column; }
+        .log-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--g-200);
+        }
+        .log-title {
+            font-family: var(--font-mono);
+            font-size: 11px;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+            color: var(--g-muted);
+        }
+        .log-count {
+            font-family: var(--font-mono);
+            font-size: 11px;
+            color: var(--g-faint);
+            font-variant-numeric: tabular-nums;
+        }
+        .log-entries {
+            flex: 1;
+            max-height: 30vh;
+            min-height: 96px;
+            overflow-y: auto;
+            padding: 8px 0;
+            font-family: var(--font-mono);
+            font-size: 12px;
+            scrollbar-width: thin;
+            scrollbar-color: var(--g-300) transparent;
+        }
+        .log-entry {
+            display: grid;
+            grid-template-columns: 76px 96px 1fr;
+            gap: 12px;
+            padding: 3px 16px;
+            color: var(--g-muted);
+            animation: fadeIn 0.25s ease-out;
+        }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        .log-time { color: var(--g-faint); font-variant-numeric: tabular-nums; }
+        .log-source { color: var(--jarvis-green); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .log-message { color: var(--g-text); overflow-wrap: anywhere; }
+        .log-entry.success .log-message { color: var(--g-text); }
+        .log-entry.warning .log-message, .log-entry.warning .log-source { color: var(--jarvis-orange); }
+        .log-entry.error .log-message, .log-entry.error .log-source { color: var(--jarvis-red); }
+
+        /* Hidden by design (legacy panels the page no longer shows). */
+        .stages-container { display: none; }
+
         .details-panel {
             padding: clamp(15px, 3vw, 25px);
             background: rgba(0, 255, 65, 0.03);
@@ -1074,98 +768,6 @@
         }
 
         /* Live operations log */
-        .operations-log {
-            background: rgba(0, 0, 0, 0.3);
-            border: 1px solid rgba(0, 255, 65, 0.2);
-            border-radius: 8px;
-            padding: 12px;
-            margin-bottom: 15px;
-        }
-
-        .log-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 10px;
-            padding-bottom: 8px;
-            border-bottom: 1px solid rgba(0, 255, 65, 0.15);
-        }
-
-        .log-title {
-            font-size: 0.8rem;
-            color: var(--jarvis-green);
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-        }
-
-        .log-count {
-            font-size: 0.7rem;
-            background: rgba(0, 255, 65, 0.2);
-            color: var(--jarvis-green);
-            padding: 2px 8px;
-            border-radius: 10px;
-        }
-
-        .log-entries {
-            max-height: 120px;
-            overflow-y: auto;
-            font-family: 'Courier New', monospace;
-            font-size: 0.75rem;
-        }
-
-        .log-entries::-webkit-scrollbar {
-            width: 4px;
-        }
-
-        .log-entries::-webkit-scrollbar-thumb {
-            background: rgba(0, 255, 65, 0.3);
-            border-radius: 2px;
-        }
-
-        .log-entry {
-            padding: 4px 8px;
-            margin: 2px 0;
-            border-radius: 3px;
-            display: flex;
-            align-items: flex-start;
-            gap: 8px;
-            animation: fadeIn 0.3s ease;
-        }
-
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateX(-10px); }
-            to { opacity: 1; transform: translateX(0); }
-        }
-
-        .log-entry.supervisor { background: rgba(0, 168, 255, 0.1); border-left: 2px solid #00a8ff; }
-        .log-entry.backend { background: rgba(0, 255, 65, 0.1); border-left: 2px solid var(--jarvis-green); }
-        .log-entry.system { background: rgba(255, 170, 0, 0.1); border-left: 2px solid #ffaa00; }
-        .log-entry.error { background: rgba(255, 68, 68, 0.1); border-left: 2px solid var(--jarvis-red); }
-        .log-entry.success { background: rgba(0, 255, 65, 0.15); border-left: 2px solid var(--jarvis-green); }
-
-        .log-time {
-            color: rgba(0, 255, 65, 0.5);
-            flex-shrink: 0;
-            width: 55px;
-        }
-
-        .log-source {
-            color: var(--jarvis-green-dark);
-            flex-shrink: 0;
-            width: 80px;
-            text-transform: uppercase;
-            font-weight: 600;
-            font-size: 0.65rem;
-        }
-
-        .log-message {
-            color: rgba(0, 255, 65, 0.9);
-            flex-grow: 1;
-            word-break: break-word;
-        }
-
-        /* System info */
         .system-info {
             display: grid;
             grid-template-columns: 1fr 1fr;
@@ -1538,78 +1140,61 @@
         }
 
         /* Error state */
+        /* ==================================================================
+           Failure: shown in place, in the console's own voice.
+           ================================================================== */
         .error-container {
+            grid-area: error;
             display: none;
-            padding: clamp(15px, 4vw, 30px);
-            background: rgba(255, 68, 68, 0.1);
-            border: 2px solid var(--jarvis-red);
-            border-radius: clamp(8px, 1.5vw, 12px);
-            animation: shake 0.5s;
-            width: 100%;
-            flex-shrink: 0;
+            padding: 16px 20px;
+            border: 1px solid rgba(255, 77, 77, 0.45);
+            border-left: 3px solid var(--jarvis-red);
+            border-radius: var(--radius);
+            background: rgba(40, 0, 0, 0.55);
+            box-shadow: 0 0 24px rgba(255, 77, 77, 0.15);
         }
-
-        .error-container.visible {
-            display: block;
-        }
-
-        .error-icon {
-            font-size: clamp(2.5rem, 6vw, 4rem);
-            margin-bottom: clamp(10px, 2vh, 20px);
-        }
-
+        .error-container.visible { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; animation: shake 0.4s ease-out; }
+        .error-icon { grid-row: span 2; font-size: 22px; line-height: 1; }
         .error-title {
-            font-size: clamp(1.2rem, 3vw, 1.8rem);
+            font-family: var(--font-mono);
+            font-size: 12px;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
             color: var(--jarvis-red);
-            margin-bottom: clamp(8px, 2vh, 15px);
-            font-weight: 700;
+        }
+        .error-message { font-size: 13px; color: #ffd6d6; overflow-wrap: anywhere; }
+        @keyframes shake { 25% { transform: translateX(-3px); } 75% { transform: translateX(3px); } }
+
+        /* ==================================================================
+           Desktop: the console is one screen; the event log scrolls inside
+           its panel. Shorter or narrower windows scroll the page instead.
+           ================================================================== */
+        @media (min-width: 901px) and (min-height: 760px) {
+            .loading-container { height: 100vh; min-height: 0; }
+            .log-panel { overflow: hidden; }
+            .log-entries { max-height: none; }
         }
 
-        .error-message {
-            font-size: clamp(0.85rem, 2vw, 1.1rem);
-            color: #ff8888;
-            line-height: 1.6;
-        }
-
-        @keyframes shake {
-            0%, 100% { transform: translateX(0); }
-            25% { transform: translateX(-10px); }
-            75% { transform: translateX(10px); }
-        }
-
-        /* Responsive - using clamp() for fluid sizing, media queries for layout changes */
-        @media (max-width: 768px) {
+        /* ==================================================================
+           Narrow screens: one column, in reading order.
+           ================================================================== */
+        @media (max-width: 900px) {
             .loading-container {
-                gap: clamp(0.3rem, 1.5vh, 1rem);
+                grid-template-columns: minmax(0, 1fr);
+                grid-template-areas: "header" "core" "side" "log" "error";
+                grid-template-rows: auto;
+                padding: var(--gap);
             }
-
-            .stages-container {
-                grid-template-columns: repeat(auto-fit, minmax(80px, 1fr));
-            }
+            .brand-tagline { display: none; }
         }
-
-        /* Extra small screens */
-        @media (max-width: 480px) {
-            .loading-container {
-                padding: clamp(0.5rem, 2vw, 1rem);
-            }
-
-            .stages-container {
-                grid-template-columns: repeat(2, 1fr);
-            }
+        @media (max-width: 520px) {
+            .console-header { flex-direction: column; align-items: flex-start; }
+            .log-entry { grid-template-columns: 64px 1fr; }
+            .log-source { display: none; }
+            .hud-frame { inset: 6px; }
         }
-
-        /* Handle landscape orientation on mobile */
-        @media (max-height: 500px) and (orientation: landscape) {
-            .loading-container {
-                min-height: auto;
-                padding-top: 1rem;
-                padding-bottom: 1rem;
-            }
-
-            .arc-reactor-wrapper {
-                --reactor-size: clamp(100px, 25vmin, 180px);
-            }
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
         }
     </style>
 </head>
@@ -1631,65 +1216,91 @@
         <div class="hud-corner bottom-right"></div>
     </div>
 
-    <!-- Connection status - v225.0: Hidden (replaced by phase timeline + progress ring) -->
-    <div class="connection-status" id="connection-status" style="display: none !important;">
-        <div class="status-indicator connecting" id="status-indicator"></div>
-        <span id="status-text">Connecting to backend...</span>
-        <span class="toggle-hint" id="toggle-hint">▼</span>
-    </div>
-
-    <!-- Main loading container - uses flexbox for responsive layout -->
+    <!-- The boot console. Element ids are the contract with loading-manager.js. -->
     <div class="loading-container">
-        <div class="jarvis-logo" style="order: 1;">J.A.R.V.I.S.</div>
-        <div class="subtitle" id="subtitle" style="order: 2;">STARTING</div>
-
-        <!-- Arc Reactor with SVG Progress Ring -->
-        <div class="arc-reactor-wrapper" style="order: 3;">
-            <!-- v225.0: SVG Circular Progress Ring -->
-            <svg class="progress-ring" viewBox="0 0 200 200">
-                <circle class="progress-ring-ticks" cx="100" cy="100" r="95" />
-                <circle class="progress-ring-bg" cx="100" cy="100" r="95" />
-                <circle class="progress-ring-fill" id="progress-ring-fill" cx="100" cy="100" r="95" />
-            </svg>
-            <div class="arc-reactor">
-                <div class="reactor-ring"></div>
-                <div class="reactor-ring"></div>
-                <div class="reactor-ring"></div>
-                <div class="reactor-core"></div>
+        <header class="console-header">
+            <div class="brand">
+                <div class="jarvis-logo">J.A.R.V.I.S.</div>
+                <div class="brand-tagline">Just A Rather Very Intelligent System</div>
             </div>
-        </div>
+            <div class="header-status">
+                <div class="connection-status" id="connection-status">
+                    <div class="status-indicator connecting" id="status-indicator"></div>
+                    <span id="status-text">Connecting to backend...</span>
+                    <span class="toggle-hint" id="toggle-hint">▼</span>
+                </div>
+                <div class="subtitle" id="subtitle">STARTING</div>
+            </div>
+        </header>
 
-        <!-- Progress percentage + ETA -->
-        <div class="progress-percentage" id="progress-percentage" style="order: 4;">0%</div>
-        <div class="eta-display" id="eta-display" style="order: 4;">
-            <span class="eta-label">ETA</span>
-            <span class="eta-value" id="eta-value">--</span>
-        </div>
-
-        <!-- Progress bar -->
-        <div class="progress-container" style="order: 5;">
-            <div class="progress-bar" id="progress-bar"></div>
-        </div>
-
-        <!-- Status message -->
-        <div class="status-message" id="status-message" style="order: 6;">Initializing JARVIS systems...</div>
-
-        <!-- Detailed status panel will be dynamically inserted here with order: 7 -->
-
-        <!-- The boot's phases, drawn from the supervisor's boot timeline
-             (loading-manager.js renderBootTimeline; backend/core/boot_timeline.py). -->
-        <div class="phase-timeline" id="phase-timeline" style="order: 8;">
-            <div class="timeline-track-wrapper">
-                <div class="timeline-track">
-                    <div class="timeline-fill" id="timeline-fill"></div>
+        <!-- The core: reactor with the progress ring, the one percentage, the estimate, what JARVIS is doing. -->
+        <section class="core-panel panel">
+            <div class="arc-reactor-wrapper">
+                <svg class="progress-ring" viewBox="0 0 200 200">
+                    <circle class="progress-ring-ticks" cx="100" cy="100" r="95" />
+                    <circle class="progress-ring-bg" cx="100" cy="100" r="95" />
+                    <circle class="progress-ring-fill" id="progress-ring-fill" cx="100" cy="100" r="95" />
+                </svg>
+                <div class="arc-reactor">
+                    <div class="reactor-ring"></div>
+                    <div class="reactor-ring"></div>
+                    <div class="reactor-ring"></div>
+                    <div class="reactor-core"></div>
                 </div>
             </div>
+            <div class="progress-percentage" id="progress-percentage">0%</div>
+            <div class="eta-display" id="eta-display">
+                <span class="eta-label">ETA</span>
+                <span class="eta-value" id="eta-value">--</span>
+            </div>
+            <div class="progress-container">
+                <div class="progress-bar" id="progress-bar"></div>
+            </div>
+            <div class="status-message" id="status-message">Initializing JARVIS systems...</div>
+        </section>
+
+        <aside class="side-panels">
+            <!-- The boot's phases, drawn from the supervisor's boot timeline
+                 (loading-manager.js renderBootTimeline; backend/core/boot_timeline.py). -->
+            <section class="panel" aria-labelledby="sequence-title">
+                <div class="panel-header">
+                    <span id="sequence-title">Boot sequence</span>
+                    <span class="panel-meta" id="sequence-meta"></span>
+                </div>
+                <div class="phase-timeline" id="phase-timeline">
+                    <div class="timeline-track-wrapper">
+                        <div class="timeline-track">
+                            <div class="timeline-fill" id="timeline-fill"></div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- The pre-flight checklist (loading-manager.js renderChecklist;
+                 backend/core/flight_check.py). Shown once the supervisor runs it. -->
+            <section class="panel" id="checklist-panel" aria-labelledby="checklist-title" hidden>
+                <div class="panel-header">
+                    <span id="checklist-title">Pre-flight checklist</span>
+                    <span class="chip" id="checklist-verdict"></span>
+                </div>
+                <ul class="checklist-items" id="checklist-items"></ul>
+            </section>
+        </aside>
+
+        <!-- Event log: what each part of JARVIS reported, as it happened. -->
+        <section class="panel log-panel">
+        <div class="operations-log" id="operations-log">
+            <div class="log-header">
+                <span class="log-title">Event log</span>
+                <span class="log-count" id="log-count">0</span>
+            </div>
+            <div class="log-entries" id="log-entries"></div>
         </div>
+        </section>
 
         <!-- Legacy stage indicators (hidden, kept for backward compat) -->
-        <div class="stages-container" id="stages-container" style="order: 8; display: none;"></div>
+        <div class="stages-container" id="stages-container"></div>
 
-        <!-- Details panel - v225.0: Removed (user cannot see real-time detail, replaced by phase timeline + ETA) -->
         <div class="details-panel" id="details-panel" style="order: 9; display: none !important;">
             <!-- Panel header with minimize button -->
             <div class="panel-control-header">
@@ -1717,13 +1328,7 @@
                 <div id="substep-list" class="substep-list"></div>
                 
                 <!-- Live operations log -->
-                <div class="operations-log" id="operations-log">
-                    <div class="log-header">
-                        <span class="log-title">⚡ Live Operations</span>
-                        <span class="log-count" id="log-count">0</span>
-                    </div>
-                    <div class="log-entries" id="log-entries"></div>
-                </div>
+
                 
                 <!-- System info -->
                 <div class="system-info">
@@ -1834,7 +1439,7 @@
         </div>
 
         <!-- Error container -->
-        <div class="error-container" id="error-container" style="order: 10;">
+        <div class="error-container" id="error-container">
             <div class="error-icon">⚠️</div>
             <div class="error-title">Startup Failed</div>
             <div class="error-message" id="error-message"></div>
@@ -2117,266 +1722,6 @@
                 window.matrixRain.destroy();
             }
         });
-    })();
-    </script>
-
-    <!-- Panel Minimize/Hide Functionality -->
-    <script>
-    (function() {
-        'use strict';
-
-        /**
-         * Panel Control - Minimize/Hide functionality for details panel
-         * v4.0: User can minimize or completely hide the status panel
-         */
-        class PanelController {
-            constructor() {
-                this.panel = document.getElementById('details-panel');
-                this.minimizeBtn = document.getElementById('panel-minimize-btn');
-                this.panelContent = document.getElementById('panel-content');
-                
-                if (!this.panel || !this.minimizeBtn) {
-                    console.warn('[PanelController] Required elements not found');
-                    return;
-                }
-
-                this.isMinimized = false;
-                this.isHidden = false;
-                this.clickCount = 0;
-                this.lastClickTime = 0;
-
-                // Load saved state from localStorage
-                this.loadState();
-
-                // Bind events
-                this.minimizeBtn.addEventListener('click', (e) => this.handleClick(e));
-                
-                // Keyboard shortcuts
-                document.addEventListener('keydown', (e) => this.handleKeydown(e));
-
-                // Connection status click to toggle panel
-                const connStatus = document.getElementById('connection-status');
-                if (connStatus) {
-                    connStatus.addEventListener('click', (e) => {
-                        // Don't trigger if clicking directly on minimize button
-                        if (e.target.closest('.panel-minimize-btn')) return;
-                        this.togglePanel();
-                    });
-                }
-
-                console.log('[PanelController] Initialized');
-            }
-
-            togglePanel() {
-                if (this.isHidden) {
-                    this.show();
-                } else {
-                    this.toggleMinimize();
-                }
-            }
-
-            loadState() {
-                try {
-                    const savedState = localStorage.getItem('jarvis_panel_state');
-                    if (savedState) {
-                        const state = JSON.parse(savedState);
-                        if (state.minimized) {
-                            this.minimize();
-                        } else if (state.hidden) {
-                            this.hide();
-                        }
-                    }
-                } catch (e) {
-                    console.debug('[PanelController] No saved state');
-                }
-            }
-
-            saveState() {
-                try {
-                    localStorage.setItem('jarvis_panel_state', JSON.stringify({
-                        minimized: this.isMinimized,
-                        hidden: this.isHidden
-                    }));
-                } catch (e) {
-                    console.debug('[PanelController] Could not save state');
-                }
-            }
-
-            handleClick(e) {
-                e.preventDefault();
-                const now = Date.now();
-                
-                // Double-click detection (within 300ms)
-                if (now - this.lastClickTime < 300) {
-                    this.clickCount++;
-                } else {
-                    this.clickCount = 1;
-                }
-                this.lastClickTime = now;
-
-                // Double-click = toggle hide completely
-                if (this.clickCount >= 2) {
-                    this.clickCount = 0;
-                    if (this.isHidden) {
-                        this.show();
-                    } else {
-                        this.hide();
-                    }
-                } else {
-                    // Single click = toggle minimize
-                    setTimeout(() => {
-                        if (this.clickCount === 1) {
-                            this.toggleMinimize();
-                        }
-                    }, 300);
-                }
-            }
-
-            handleKeydown(e) {
-                // 'M' key = toggle minimize
-                // 'H' key = toggle hide
-                // Escape = show panel if hidden
-                if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
-
-                switch(e.key.toLowerCase()) {
-                    case 'm':
-                        if (!e.ctrlKey && !e.metaKey) {
-                            this.toggleMinimize();
-                        }
-                        break;
-                    case 'h':
-                        if (!e.ctrlKey && !e.metaKey) {
-                            if (this.isHidden) {
-                                this.show();
-                            } else {
-                                this.hide();
-                            }
-                        }
-                        break;
-                    case 'escape':
-                        if (this.isHidden) {
-                            this.show();
-                        }
-                        break;
-                }
-            }
-
-            toggleMinimize() {
-                if (this.isMinimized) {
-                    this.expand();
-                } else {
-                    this.minimize();
-                }
-            }
-
-            minimize() {
-                this.panel.classList.add('minimized');
-                this.minimizeBtn.title = 'Expand panel';
-                this.minimizeBtn.setAttribute('aria-label', 'Expand panel');
-                this.isMinimized = true;
-                this.isHidden = false;
-                this.saveState();
-            }
-
-            expand() {
-                this.panel.classList.remove('minimized');
-                this.minimizeBtn.title = 'Minimize panel (double-click to hide)';
-                this.minimizeBtn.setAttribute('aria-label', 'Minimize panel');
-                this.isMinimized = false;
-                this.saveState();
-            }
-
-            hide() {
-                this.panel.classList.add('hidden');
-                this.isHidden = true;
-                this.isMinimized = false;
-                this.saveState();
-                this.updateConnectionStatusIcon();
-                
-                // Show toast notification with restore hint
-                this.showRestoreHint();
-            }
-
-            show() {
-                this.panel.classList.remove('hidden', 'minimized');
-                this.minimizeBtn.title = 'Minimize panel (double-click to hide)';
-                this.isHidden = false;
-                this.isMinimized = false;
-                this.saveState();
-                this.updateConnectionStatusIcon();
-            }
-
-            updateConnectionStatusIcon() {
-                const connStatus = document.getElementById('connection-status');
-                if (connStatus) {
-                    if (this.isHidden) {
-                        connStatus.classList.add('panel-hidden');
-                    } else {
-                        connStatus.classList.remove('panel-hidden');
-                    }
-                }
-            }
-
-            showRestoreHint() {
-                // Create a temporary toast notification
-                const toast = document.createElement('div');
-                toast.className = 'panel-restore-hint';
-                toast.innerHTML = `
-                    <span>Panel hidden. Click status badge, press <kbd>H</kbd> or <kbd>Esc</kbd> to restore</span>
-                `;
-                toast.style.cssText = `
-                    position: fixed;
-                    bottom: 20px;
-                    right: 20px;
-                    background: rgba(0, 255, 65, 0.1);
-                    border: 1px solid rgba(0, 255, 65, 0.3);
-                    border-radius: 8px;
-                    padding: 12px 20px;
-                    color: var(--jarvis-green, #00ff41);
-                    font-size: 0.85rem;
-                    z-index: 1000;
-                    animation: fadeInUp 0.3s ease;
-                `;
-                
-                // Add fadeInUp animation if not exists
-                if (!document.getElementById('panel-hint-styles')) {
-                    const style = document.createElement('style');
-                    style.id = 'panel-hint-styles';
-                    style.textContent = `
-                        @keyframes fadeInUp {
-                            from { opacity: 0; transform: translateY(10px); }
-                            to { opacity: 1; transform: translateY(0); }
-                        }
-                        .panel-restore-hint kbd {
-                            background: rgba(0, 255, 65, 0.2);
-                            border: 1px solid rgba(0, 255, 65, 0.4);
-                            border-radius: 3px;
-                            padding: 2px 6px;
-                            font-family: monospace;
-                        }
-                    `;
-                    document.head.appendChild(style);
-                }
-                
-                document.body.appendChild(toast);
-                
-                // Remove after 3 seconds
-                setTimeout(() => {
-                    toast.style.opacity = '0';
-                    toast.style.transition = 'opacity 0.3s';
-                    setTimeout(() => toast.remove(), 300);
-                }, 3000);
-            }
-        }
-
-        // Initialize when DOM is ready
-        if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', () => {
-                window.panelController = new PanelController();
-            });
-        } else {
-            window.panelController = new PanelController();
-        }
     })();
     </script>
 </body>
