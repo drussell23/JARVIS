@@ -73,8 +73,17 @@ class TestOneSwitch:
         from backend.core.supervisor import unified_voice_orchestrator as u
         src = inspect.getsource(u.safe_say)
         assert "_voice_muted()" in src
-        # Before the gate AND before skip_gate's carve-out.
-        assert src.index("_voice_muted()") < src.index("if not skip_gate")
+        # Before the presence gate AND before skip_gate's carve-out.
+        assert src.index("_voice_muted()") < src.index("speech_gate(urgent=skip_gate)")
+
+    def test_the_mute_outranks_an_urgent_line_at_the_gate(self, monkeypatch):
+        """Every other entry point asks the same gate; there too the mute
+        wins over urgency."""
+        import backend.core.voice_mute as vm
+        from backend.core.operator_presence import speech_gate
+
+        monkeypatch.setattr(vm, "voice_muted", lambda: True)
+        assert speech_gate(urgent=True) == "muted"
 
     def test_a_broken_env_read_never_silences_by_accident(self, monkeypatch):
         """Fail OPEN: an unreadable flag must not mute the organism, or a

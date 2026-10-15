@@ -178,27 +178,16 @@ def operator_present() -> bool:
     `publish_markup` returns early when `_clients` is empty. Speech had no
     equivalent, so it addressed an empty room.
 
-    Two ways a human can be present, and both count:
-
-      * a cockpit is ATTACHED over the bridge (`ov attach`), or
-      * this process owns a real terminal (a foreground run with its own
-        REPL, where the operator is looking straight at it).
-
-    The TTY arm is also the honest degradation: if the bridge cannot be
-    consulted at all, a detached daemon has no terminal and falls silent
-    while a foreground run keeps its voice — which is the correct answer in
-    both cases, reached without guessing.
+    A human is present when a cockpit is ATTACHED over the bridge (`ov
+    attach`), when this process owns a real terminal, or -- for a Body
+    running on the operator's own desktop -- when its desktop or Remote
+    Desktop session is active. One answer for the whole process, composed in
+    backend/core/operator_presence (where an arm that cannot be read, as the
+    desktop session cannot from inside WSL, simply has no say).
     """
     try:
-        if attached_cockpits() > 0:
-            return True
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        from backend.core.ouroboros.battle_test.presentation_restraint import (
-            real_stdout_isatty,
-        )
-        return bool(real_stdout_isatty())
+        from backend.core.operator_presence import operator_present as _present
+        return _present()
     except Exception:  # noqa: BLE001
         return False
 

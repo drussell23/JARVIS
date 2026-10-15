@@ -72267,7 +72267,6 @@ class JarvisSystemKernel:
             )
 
             # Capture references for the background closure
-            _narrator_ref = self._narrator
             _startup_dur = startup_duration
 
             async def _run_completion_hooks_bg() -> None:
@@ -72289,21 +72288,13 @@ class JarvisSystemKernel:
                     except Exception:
                         pass  # Best-effort — logged at DEBUG if needed
 
+                # Completion is SPOKEN once, by the lifecycle narrator, from a
+                # fresh health measurement ("Boot complete ... Boot took N
+                # seconds", above). Two more completion lines used to follow
+                # here -- "Startup complete in N seconds. <greeting>" and "All
+                # systems online in N seconds" -- a second greeting and an
+                # "all systems" claim nothing measured.
                 try:
-                    if _narrator_ref:
-                        await _run_hook(
-                            "async_narrator.startup_complete",
-                            lambda: _narrator_ref.narrate_startup_complete(
-                                duration_sec=_startup_dur,
-                            ),
-                        )
-                    if BACKEND_NARRATOR_FUNCS_AVAILABLE and _narrate_backend_complete:
-                        await _run_hook(
-                            "startup_narrator.complete",
-                            lambda: _narrate_backend_complete(
-                                f"All systems online in {_startup_dur:.1f} seconds"
-                            ),
-                        )
                     if ORCHESTRATOR_NARRATOR_AVAILABLE and emit_orchestrator_event:
                         await _run_hook(
                             "orchestrator_narrator.startup_complete",
@@ -83031,16 +83022,11 @@ class JarvisSystemKernel:
                     message=f"Trinity integration status: {trinity_status_message}"
                 )
 
-                # Voice narration for Trinity components
-                if self._narrator:
-                    for component, connected in _component_results.items():
-                        try:
-                            await self._narrator.narrate_trinity_status(
-                                component=component,
-                                connected=connected,
-                            )
-                        except Exception:
-                            pass
+                # No per-component voice line here: the Trinity readiness tier
+                # says what the siblings measured ("J-Prime and Reactor-Core
+                # are connected", _describe_tier_change). This loop said it a
+                # second time ("jarvis-prime linked." per component), unasked
+                # by any gate and unmeasured.
 
                 # v265.6: Schedule background recovery for Trinity components that
                 # failed or errored during startup. Recovery loop will periodically

@@ -84,6 +84,24 @@ def voice_muted() -> bool:
     return False
 
 
+#: Metadata key a caller sets on a line urgent enough to be said whether
+#: or not anyone is there (an emergency, a shutdown). The mute still wins.
+URGENT_KEY = "urgent"
+
+
+def is_urgent(priority=None, metadata=None) -> bool:
+    """Is a line urgent enough to be said with nobody there? Every voice
+    stack names its top priority CRITICAL (an enum member or a string), and
+    any caller may mark a line with :data:`URGENT_KEY`. NEVER raises."""
+    try:
+        name = getattr(priority, "name", priority)
+        if isinstance(name, str) and name.upper() == "CRITICAL":
+            return True
+        return bool((metadata or {}).get(URGENT_KEY))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def mute(scope: str = "repo") -> str:
     """Create the sentinel. Returns the path written, or "". NEVER raises."""
     try:
@@ -116,8 +134,10 @@ def unmute() -> int:
 __all__ = [
     "MASTER_MUTE_ENV_VAR",
     "SENTINEL_NAME",
+    "URGENT_KEY",
     "mute",
     "sentinel_paths",
+    "is_urgent",
     "unmute",
     "voice_muted",
 ]

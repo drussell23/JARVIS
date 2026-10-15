@@ -842,6 +842,20 @@ class UnifiedVoiceOrchestrator:
 
     async def _speak_message(self, message: VoiceMessage) -> None:
         """Speak a single message (with global lock)."""
+        # Every queued line asks THE gate (backend/core/voice_mute.speech_gate)
+        # at the moment it would be said: the legacy narrators speak through
+        # this queue and never asked -- in a background boot they were the
+        # only voice heard, past the mute and to an empty room. A CRITICAL
+        # line (or one marked urgent) is said whether or not anyone is there;
+        # the mute still wins.
+        from backend.core.operator_presence import speech_gate
+        from backend.core.voice_mute import is_urgent
+        _blocked = speech_gate(urgent=is_urgent(message.priority, message.metadata))
+        if _blocked:
+            logger.debug("🔇 %s — not speaking (%s, %s): %s", _blocked,
+                         message.priority.name, message.topic.value, message.text[:60])
+            self._metrics.messages_skipped += 1
+            return
         # Acquire the global speech lock
         async with self._speech_lock:
             start_time = time.time()
@@ -1486,19 +1500,14 @@ async def safe_say(
     # `skip_gate` is the deliberate carve-out and it already existed for
     # exactly this class of message: something urgent enough to say whether
     # or not the room is ready for it. Emergencies still speak.
-    if not skip_gate:
-        try:
-            from backend.core.ouroboros.battle_test.cockpit_attach import (
-                operator_present,
-            )
-            if not operator_present():
-                logger.debug(
-                    "[safe_say:%s] no operator present — not speaking: %s",
-                    source, text[:60],
-                )
-                return False
-        except Exception:  # noqa: BLE001 — presence is a courtesy, not a gate
-            pass
+    # The one gate (backend/core/voice_mute.speech_gate): presence is read
+    # from the cockpit, the terminal AND the OS desktop session.
+    from backend.core.operator_presence import speech_gate
+    from backend.core.voice_mute import URGENT_KEY
+    _blocked = speech_gate(urgent=skip_gate)
+    if _blocked:
+        logger.debug("[safe_say:%s] %s — not speaking: %s", source, _blocked, text[:60])
+        return False
 
     from backend.core.voice_persona import persona as _persona
     voice = voice or _persona().name
@@ -1516,6 +1525,8 @@ async def safe_say(
             queued, _reason = await _trinity_announce(
                 text, priority=_TrinityPriority.HIGH if skip_dedup else _TrinityPriority.NORMAL,
                 source=f"safe_say:{source}",
+                # The coordinator asks the same gate; an urgent line stays urgent.
+                metadata={URGENT_KEY: bool(skip_gate)},
             )
             return bool(queued)
         except Exception as exc:  # noqa: BLE001

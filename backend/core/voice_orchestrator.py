@@ -648,6 +648,16 @@ class VoiceOrchestrator:
                 msg = await asyncio.wait_for(self._queue.get(), timeout=1.0)
                 self._metrics.queue_depth = self._queue.qsize()
 
+                # THE gate (backend/core/voice_mute.speech_gate), asked when
+                # the line would be said -- IPC announcements from other
+                # processes arrive here without having asked it.
+                from backend.core.operator_presence import speech_gate
+                from backend.core.voice_mute import is_urgent
+                _blocked = speech_gate(urgent=is_urgent(msg.priority))
+                if _blocked:
+                    logger.debug(f"[Voice] {_blocked} — not speaking: {msg.text[:60]}")
+                    continue
+
                 # Speak the message
                 if self._tts_callback:
                     try:

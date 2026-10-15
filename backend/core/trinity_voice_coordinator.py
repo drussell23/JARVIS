@@ -2307,6 +2307,17 @@ class TrinityVoiceCoordinator:
         Returns:
             (success: bool, reason: str) tuple
         """
+        # THE gate (backend/core/voice_mute.speech_gate), asked once at entry:
+        # every caller that announces here directly (narration, the voice
+        # API, cross-repo clients) gets the answer safe_say gets. CRITICAL,
+        # or metadata marked urgent, is said whether or not anyone is there.
+        from backend.core.operator_presence import speech_gate
+        from backend.core.voice_mute import is_urgent
+        _blocked = speech_gate(urgent=is_urgent(priority, metadata))
+        if _blocked:
+            logger.debug("[TrinityVoice] %s — not announcing: %s", _blocked, message[:60])
+            return False, _blocked.replace(" ", "_")
+
         announcement = VoiceAnnouncement(
             message=message,
             context=context,

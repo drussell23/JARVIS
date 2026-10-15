@@ -57,9 +57,20 @@ class TestEveryPathIsGuarded:
             if node.name not in names:
                 continue
             body = ast.get_source_segment(src, node) or ""
-            assert "voice_muted" in body, f"{rel}:{node.lineno} {node.name}"
+            # The mute itself, or the one gate that asks it first
+            # (operator_presence.speech_gate; pinned below).
+            assert "voice_muted" in body or "speech_gate" in body,                 f"{rel}:{node.lineno} {node.name}"
             found += 1
         assert found, f"{rel}: no entry point found — did it move?"
+
+    def test_the_one_gate_asks_the_mute_first(self, monkeypatch):
+        """Entry points that ask `speech_gate` get the mute through it."""
+        import backend.core.voice_mute as vm
+        from backend.core.operator_presence import speech_gate
+
+        monkeypatch.setattr(vm, "voice_muted", lambda: True)
+        assert speech_gate() == "muted"
+        assert speech_gate(urgent=True) == "muted"
 
     def test_the_answer_lives_in_a_LEAF_module(self):
         """`voice_mute` must import nothing from the codebase, or some

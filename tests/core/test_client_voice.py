@@ -35,8 +35,9 @@ def host(monkeypatch):
     monkeypatch.setattr(tvc, "announce", announce)
     monkeypatch.setattr(uvo.shutil, "which", lambda _name: None)       # the Windows path
     monkeypatch.setattr(uvo, "_voice_muted", lambda: False)
-    from backend.core.ouroboros.battle_test import cockpit_attach
-    monkeypatch.setattr(cockpit_attach, "operator_present", lambda: True)
+    from backend.core import operator_presence
+    monkeypatch.setattr(operator_presence, "presence",
+                        lambda: operator_presence.PresenceReading(True, "test", 0.0))
     uvo._global_speech_fingerprints.clear()
     return said
 

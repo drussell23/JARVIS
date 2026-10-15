@@ -100,26 +100,42 @@ class TestTheSpeechPrimitiveHonoursIt:
         something urgent enough to say whether or not the room is ready. An
         emergency must not be silenced by an absent audience."""
         import inspect
+        from backend.core import operator_presence as op
         from backend.core.supervisor import unified_voice_orchestrator as uvo
-        src = inspect.getsource(uvo.safe_say)
-        gate = src[src.index("IS ANYBODY THERE"):src.index("1. Dedup")]
-        assert "if not skip_gate:" in gate
+        # safe_say hands its urgency to the one gate ...
+        assert "speech_gate(urgent=skip_gate)" in inspect.getsource(uvo.safe_say)
+        # ... and the gate lets an urgent line through an empty room.
+        absent = op.PresenceReading(False, "", 0.0)
+        original = op.presence
+        op.presence = lambda: absent
+        try:
+            assert op.speech_gate(urgent=True) == ""
+            assert op.speech_gate() == "no operator present"
+        finally:
+            op.presence = original
 
     def test_the_gate_is_at_the_ONE_primitive(self):
         """Thirteen modules call `safe_say`. Gating each would be thirteen
-        chances to miss one, and the fourteenth would ship ungated."""
+        chances to miss one, and the fourteenth would ship ungated -- and
+        safe_say's gate is the same one every other entry point asks."""
         import inspect
         from backend.core.supervisor import unified_voice_orchestrator as uvo
-        assert "operator_present" in inspect.getsource(uvo.safe_say)
+        assert "speech_gate(" in inspect.getsource(uvo.safe_say)
 
     def test_presence_is_a_courtesy_not_a_hard_gate(self):
-        """If the check itself fails, speech proceeds. A broken import must
-        not mute the assistant."""
-        import inspect
-        from backend.core.supervisor import unified_voice_orchestrator as uvo
-        src = inspect.getsource(uvo.safe_say)
-        gate = src[src.index("IS ANYBODY THERE"):src.index("1. Dedup")]
-        assert "except Exception" in gate and "pass" in gate
+        """If the check itself fails, speech proceeds. A broken presence read
+        must not mute the assistant."""
+        from backend.core import operator_presence as op
+
+        def broken():
+            raise RuntimeError("presence unreadable")
+
+        original = op.presence
+        op.presence = broken
+        try:
+            assert op.speech_gate() == ""
+        finally:
+            op.presence = original
 
 
 class _FakeBridge:

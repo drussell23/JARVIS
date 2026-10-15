@@ -280,8 +280,9 @@ class CrossRepoVoiceClient:
         # gets the same answer; a mute honoured by only some of them
         # is not a mute.
         try:
-            from backend.core.voice_mute import voice_muted
-            if voice_muted():
+            from backend.core.operator_presence import speech_gate
+            from backend.core.voice_mute import is_urgent
+            if speech_gate(urgent=is_urgent(priority, metadata)):
                 return False
         except Exception:  # noqa: BLE001
             pass
