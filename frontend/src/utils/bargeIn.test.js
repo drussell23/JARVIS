@@ -1,6 +1,6 @@
-import { echoOverlap, judgeHeardWhileSpeaking, wordsOf } from './bargeIn';
+import { decideHeard, echoOverlap, judgeHeardWhileSpeaking, wordsOf } from './bargeIn';
 
-const policy = { enabled: true, min_words: 2, echo_overlap: 0.6, cooldown_ms: 500 };
+const policy = { enabled: true, min_words: 2, echo_overlap: 0.6, cooldown_ms: 500, echo_tail_ms: 2500 };
 const line = 'Derek, you have three meetings tomorrow. First up is a screening at 8 AM on Microsoft Teams.';
 
 describe('bargeIn', () => {
@@ -39,5 +39,47 @@ describe('bargeIn', () => {
     expect(judgeHeardWhileSpeaking('derek stop now', [line], { ...policy, echo_overlap: 0.3 }).verdict)
       .toBe('echo');
     expect(judgeHeardWhileSpeaking('stop that what about friday', [line], null).verdict).toBe('undecided');
+  });
+});
+
+// What the page does with each result (2026-10-15: JARVIS's "Let me check."
+// came back after the line ended and was sent as the user's command).
+describe('decideHeard', () => {
+  const ack = 'Let me check.';
+  const moment = (over) => ({ speaking: false, msSinceSpoke: null, msSinceBargeIn: null,
+    utteranceJudged: false, ...over });
+
+  test('its own echo, finalised after the line ended, is ignored', () => {
+    const heard = decideHeard('let me check your account', [ack, line], policy, moment({ msSinceSpoke: 1200 }));
+    expect(heard.action).toBe('ignore');
+  });
+
+  test('the user talking over JARVIS interrupts it; right after it, is the user', () => {
+    expect(decideHeard('what about friday', [line], policy, moment({ speaking: true })).action)
+      .toBe('interrupt');
+    expect(decideHeard('what about friday', [line], policy, moment({ msSinceSpoke: 800 })).action)
+      .toBe('user');
+  });
+
+  test('outside the speech and its echo window, the usual handling applies', () => {
+    expect(decideHeard('let me check', [ack], policy, moment({ msSinceSpoke: 9000 })).action).toBe('pass');
+    expect(decideHeard('let me check', [ack], policy, moment()).action).toBe('pass');
+  });
+
+  test('an utterance is judged once: its later words are the same speaker', () => {
+    // "what's 17 times 23" re-interrupted itself at every interim result.
+    const later = moment({ speaking: true, utteranceJudged: true });
+    expect(decideHeard('three meetings tomorrow', [line], policy, later).action).toBe('pass');
+  });
+
+  test('right after an interruption, the cooldown holds', () => {
+    const heard = decideHeard('what about friday', [line], policy, moment({ speaking: true, msSinceBargeIn: 100 }));
+    expect(heard).toMatchObject({ action: 'ignore', reason: 'cooldown' });
+  });
+
+  test('no policy, or a policy switched off, changes nothing', () => {
+    expect(decideHeard('stop now', [line], null, moment({ speaking: true })).action).toBe('pass');
+    expect(decideHeard('stop now', [line], { ...policy, enabled: false }, moment({ speaking: true })).action)
+      .toBe('pass');
   });
 });

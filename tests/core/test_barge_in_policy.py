@@ -15,7 +15,8 @@ import pytest
 from backend.core.barge_in_policy import barge_in_policy
 
 _SETTINGS = ("JARVIS_BARGE_IN_ENABLED", "JARVIS_BARGE_IN_MIN_WORDS",
-             "JARVIS_BARGE_IN_ECHO_OVERLAP", "JARVIS_BARGEIN_COOLDOWN_MS")
+             "JARVIS_BARGE_IN_ECHO_OVERLAP", "JARVIS_BARGEIN_COOLDOWN_MS",
+             "JARVIS_BARGE_IN_ECHO_TAIL_MS")
 
 
 @pytest.fixture(autouse=True)
@@ -35,8 +36,10 @@ def test_the_operator_sets_it_and_it_applies_without_a_restart(monkeypatch):
     monkeypatch.setenv("JARVIS_BARGE_IN_MIN_WORDS", "3")
     monkeypatch.setenv("JARVIS_BARGE_IN_ECHO_OVERLAP", "0.8")
     monkeypatch.setenv("JARVIS_BARGEIN_COOLDOWN_MS", "0")
+    monkeypatch.setenv("JARVIS_BARGE_IN_ECHO_TAIL_MS", "4000")
     assert barge_in_policy().as_dict() == {
-        "enabled": False, "min_words": 3, "echo_overlap": 0.8, "cooldown_ms": 0}
+        "enabled": False, "min_words": 3, "echo_overlap": 0.8, "cooldown_ms": 0,
+        "echo_tail_ms": 4000}
 
 
 @pytest.mark.parametrize("name,raw", [
@@ -46,6 +49,7 @@ def test_the_operator_sets_it_and_it_applies_without_a_restart(monkeypatch):
     ("JARVIS_BARGE_IN_ECHO_OVERLAP", "1.5"),
     ("JARVIS_BARGE_IN_ECHO_OVERLAP", "0"),
     ("JARVIS_BARGEIN_COOLDOWN_MS", "-1"),
+    ("JARVIS_BARGE_IN_ECHO_TAIL_MS", "-5"),
 ])
 def test_a_typo_is_the_default_never_a_broken_listener(monkeypatch, name, raw):
     default = barge_in_policy()
@@ -58,4 +62,4 @@ def test_the_page_reads_the_policy_from_the_backend(monkeypatch):
     monkeypatch.setenv("JARVIS_BARGE_IN_MIN_WORDS", "2")
     served = asyncio.run(main.audio_barge_in())
     assert served["min_words"] == 2 and set(served) == {
-        "enabled", "min_words", "echo_overlap", "cooldown_ms"}
+        "enabled", "min_words", "echo_overlap", "cooldown_ms", "echo_tail_ms"}

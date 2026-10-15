@@ -26,6 +26,12 @@ Settings (environment):
   JARVIS_BARGEIN_COOLDOWN_MS    -- after an interruption, how long further
                                    ones are ignored (shared with
                                    backend/audio/barge_in_controller).
+  JARVIS_BARGE_IN_ECHO_TAIL_MS  -- how long after JARVIS stops speaking its
+                                   echo can still arrive: a line comes back
+                                   through a remote session's microphone and
+                                   the recogniser finalises it a second or
+                                   two later, so "let me check" was heard as
+                                   the user after the line had ended.
 """
 from __future__ import annotations
 
@@ -45,6 +51,7 @@ class BargeInPolicy:
     min_words: int
     echo_overlap: float
     cooldown_ms: int
+    echo_tail_ms: int
 
     def as_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -82,6 +89,7 @@ def barge_in_policy() -> BargeInPolicy:
         min_words=_setting("JARVIS_BARGE_IN_MIN_WORDS", 1, int, lambda v: v >= 1),
         echo_overlap=_setting("JARVIS_BARGE_IN_ECHO_OVERLAP", 0.6, float, lambda v: 0.0 < v <= 1.0),
         cooldown_ms=_setting("JARVIS_BARGEIN_COOLDOWN_MS", 500, int, lambda v: v >= 0),
+        echo_tail_ms=_setting("JARVIS_BARGE_IN_ECHO_TAIL_MS", 2500, int, lambda v: v >= 0),
     )
 
 

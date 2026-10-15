@@ -14,7 +14,7 @@
 
 let policyPromise = null;
 
-/** The barge-in policy: {enabled, min_words, echo_overlap, cooldown_ms}. */
+/** The barge-in policy: {enabled, min_words, echo_overlap, cooldown_ms, echo_tail_ms}. */
 export function getBargeInPolicy(apiUrl) {
   if (!policyPromise) {
     policyPromise = fetch(`${apiUrl}/audio/barge-in`)
@@ -76,4 +76,28 @@ export function judgeHeardWhileSpeaking(heard, spokenLines, policy) {
   const overlap = (spokenLines || []).reduce(
     (best, line) => Math.max(best, echoOverlap(heard, line)), 0);
   return { verdict: overlap >= policy.echo_overlap ? 'echo' : 'user', overlap };
+}
+
+/**
+ * What to do with one recognition result, given where JARVIS's voice is:
+ *   'interrupt' -- the user is talking over JARVIS: stop it;
+ *   'user'      -- the user, just after JARVIS finished (its echo window);
+ *   'ignore'    -- JARVIS's echo, or too little heard to tell, or within the
+ *                  cooldown of the last interruption;
+ *   'pass'      -- outside JARVIS's speech and its echo window (or already
+ *                  judged as the user's utterance): the usual handling.
+ * *moment*: {speaking, msSinceSpoke (null when JARVIS has not spoken),
+ *            msSinceBargeIn (null when never), utteranceJudged}.
+ */
+export function decideHeard(heard, spokenLines, policy, moment) {
+  if (!policy || !policy.enabled || moment.utteranceJudged) return { action: 'pass', overlap: 0 };
+  const inEchoTail = !moment.speaking && moment.msSinceSpoke !== null
+    && moment.msSinceSpoke < (policy.echo_tail_ms || 0);
+  if (!moment.speaking && !inEchoTail) return { action: 'pass', overlap: 0 };
+  if (moment.speaking && moment.msSinceBargeIn !== null && moment.msSinceBargeIn < policy.cooldown_ms) {
+    return { action: 'ignore', overlap: 0, reason: 'cooldown' };
+  }
+  const { verdict, overlap } = judgeHeardWhileSpeaking(heard, spokenLines, policy);
+  if (verdict !== 'user') return { action: 'ignore', overlap, reason: verdict };
+  return { action: moment.speaking ? 'interrupt' : 'user', overlap };
 }

@@ -22,7 +22,7 @@ import EnvironmentalStatsDisplay from './EnvironmentalStatsDisplay'; // Environm
 import AudioQualityStatsDisplay from './AudioQualityStatsDisplay'; // Audio quality stats display
 import CommandDetectionBanner from './CommandDetectionBanner'; // 🆕 Command detection banner for streaming safeguard
 import { getJarvisConnectionService, ConnectionState, connectionStateToJarvisStatus, VOICE_PLAYBACK_CAPABILITY } from '../services/JarvisConnectionService';
-import { getBargeInPolicy, judgeHeardWhileSpeaking, resetBargeInPolicy } from '../utils/bargeIn'; // ✋ talk over JARVIS // 🆕 Unified connection service
+import { decideHeard, getBargeInPolicy, resetBargeInPolicy } from '../utils/bargeIn'; // ✋ talk over JARVIS // 🆕 Unified connection service
 import TrainingStatus from './TrainingStatus'; // 🆕 Real-time training progress display (Feedback Loop)
 import { getContinuousAudioBuffer } from '../utils/ContinuousAudioBuffer'; // 🆕 Continuous audio pre-buffer for first-attempt recognition
 import { initDynamicFavicon, setFaviconState } from '../utils/DynamicFavicon'; // 🆕 Dynamic JARVIS favicon
@@ -1914,8 +1914,11 @@ const JarvisVoice = () => {
         // acknowledgement while it works): played here, in turn, in JARVIS's
         // voice. The reply's text is shown by its command_response. A command
         // the user talked over says nothing more.
+        // What is said is shown: an acknowledgement ("Let me check.") was
+        // heard with nothing on screen. The reply itself is shown by its
+        // command_response, with its full text.
         if (data.text && !(data.requestId && silencedRequestsRef.current.has(data.requestId))) {
-          speakResponse(data.text, false, data.requestId || null);
+          speakResponse(data.text, data.source !== 'command_reply', data.requestId || null);
         }
         break;
       case 'command_ack':
@@ -3957,16 +3960,31 @@ const JarvisVoice = () => {
         // ============================================================
         // ✋ BARGE-IN: heard while JARVIS speaks -- its echo, or the user?
         // ============================================================
+        // Judged while JARVIS speaks AND for the echo tail after it stops:
+        // a line comes back through a remote session's microphone and is
+        // finalised a second or two later ("let me check" was heard as the
+        // user after the line had ended, 2026-10-15). An utterance is judged
+        // once -- the rest of it is the same speaker, and re-judging each
+        // interim re-interrupted the user's own sentence.
         const barge = bargeInStateRef.current;
-        if (listensThroughSpeech() && (isSpeakingRef.current || fetchingAudioRef.current)) {
-          const policy = bargeInPolicyRef.current;
-          if (Date.now() - barge.lastAt < policy.cooldown_ms) return;
-          const { verdict, overlap } = judgeHeardWhileSpeaking(transcript, linesBeingSaid(), policy);
-          if (verdict !== 'user') {
-            console.log(`👂 [Barge-in] ${verdict}: "${transcript.substring(0, 50)}" (overlap ${(overlap * 100).toFixed(0)}%)`);
-            return;
-          }
-          bargeIn(transcript, overlap);
+        const spokeAt = selfVoiceSuppressionRef.current.speakingEndTime;
+        const heard = decideHeard(transcript, linesBeingSaid(), bargeInPolicyRef.current, {
+          speaking: isSpeakingRef.current || fetchingAudioRef.current,
+          msSinceSpoke: spokeAt > 0 ? Date.now() - spokeAt : null,
+          msSinceBargeIn: barge.lastAt > 0 ? Date.now() - barge.lastAt : null,
+          utteranceJudged: barge.utteranceActive,
+        });
+        if (heard.action === 'ignore') {
+          console.log(`👂 [Barge-in] ${heard.reason}: "${transcript.substring(0, 50)}" (overlap ${(heard.overlap * 100).toFixed(0)}%)`);
+          return;
+        }
+        if (heard.action === 'interrupt') {
+          bargeIn(transcript, heard.overlap);
+        } else if (heard.action === 'user') {
+          // The user, just after JARVIS finished: theirs, not its echo.
+          barge.utteranceActive = true;
+          setIsWaitingForCommand(true);
+          isWaitingForCommandRef.current = true;
         }
         // The rest of an interrupting utterance is the user's own words.
         const interrupting = barge.utteranceActive;
@@ -4042,8 +4060,12 @@ const JarvisVoice = () => {
         console.log(`🎙️ Speech detected: "${transcript}" (final: ${isFinal}, original: ${(confidence * 100).toFixed(1)}%, enhanced: ${(enhancedConfidence * 100).toFixed(1)}%) | Threshold: ${(adaptiveDecision.threshold * 100).toFixed(1)}% | Should Process: ${shouldProcess}`);
         console.log(`📊 Reason: ${adaptiveDecision.reason}`);
 
-        // 🆕 Lower the high confidence threshold from 0.85 to 0.70 for better first-attempt recognition
-        const isHighConfidence = enhancedConfidence >= 0.70;
+        // An utterance is a command when the recognizer finalizes it -- the
+        // user has stopped speaking. Interim results are the sentence still
+        // being said: sending a confident interim cut "what's 17 times 23"
+        // into three commands ("what's", "what's 17 *", ...), each answered
+        // over the user who was still talking (2026-10-15).
+        const utteranceComplete = isFinal;
 
         // Process based on adaptive decision
         if (!shouldProcess && !isWaitingForCommandRef.current) return;
@@ -4085,7 +4107,6 @@ const JarvisVoice = () => {
               continuousListening: continuousListeningRef.current,
               isListening,
               isFinal,
-              isHighConfidence
             });
 
             // Check if there's a command after the wake word in the same sentence
@@ -4098,9 +4119,9 @@ const JarvisVoice = () => {
               commandAfterWakeWord = commandAfterWakeWord.substring(wakeWordIndex + detectedWakeWord.length).trim();
             }
 
-            // If there's a command after the wake word, process it directly (for final or high-confidence results)
-            if (commandAfterWakeWord.length > 5 && (isFinal || isHighConfidence)) {
-              console.log('🎯 Command found after wake word:', commandAfterWakeWord, `(${isFinal ? 'final' : 'high-confidence'})`);
+            // A command after the wake word, once the utterance is complete
+            if (commandAfterWakeWord.length > 5 && utteranceComplete) {
+              console.log('🎯 Command found after wake word:', commandAfterWakeWord);
 
               // Process the command immediately with confidence info
               handleVoiceCommand(commandAfterWakeWord, {
@@ -4124,14 +4145,10 @@ const JarvisVoice = () => {
 
         // When waiting for command after wake word, process any speech
         if (isWaitingForCommandRef.current && transcript.length > 0) {
-          // Process final results OR high-confidence interim results for faster response
-          if (!isFinal && !isHighConfidence) return;
+          // The sentence is still being said: wait for the recognizer's final result.
+          if (!utteranceComplete) return;
 
-          // For interim results, wait for a complete command (at least 5 chars)
-          if (!isFinal && transcript.length < 5) return;
-
-          // Log what we're processing
-          console.log(`🎯 Processing ${isFinal ? 'final' : 'high-confidence interim'} command result`);
+          console.log('🎯 Processing final command result');
 
           // Filter out wake words from commands
           const wakeWords = ['hey jarvis', 'jarvis', 'ok jarvis', 'hello jarvis'];
