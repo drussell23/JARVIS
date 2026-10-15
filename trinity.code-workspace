@@ -1,0 +1,23 @@
+{
+  // The Trinity checkouts as ONE VS Code workspace with THREE project roots.
+  //
+  // Opening their parent folder made it the only root: no repository's own
+  // configuration applied (each repo's pyrightconfig.json and .vscode/
+  // settings.json belong to its folder, not to the parent), so Pylance
+  // analysed ~8,500 files under its defaults until it ran out of memory
+  // (2026-10-14: "JavaScript heap out of memory", exit 134). As roots, each
+  // repository is analysed with its own includes and excludes.
+  //
+  // Open with: File > Open Workspace from File... > jarvis/trinity.code-workspace
+  // (or `code jarvis/trinity.code-workspace`).
+  //
+  // Pylance's memory ceiling is a MACHINE setting, which VS Code does not
+  // read from a workspace: set "python.analysis.nodeExecutable": "auto" in
+  // User settings (Pylance then runs in a Node.js of its own, with the 8 GB
+  // heap of python.analysis.nodeArguments).
+  "folders": [
+    { "name": "jarvis (Body)", "path": "." },
+    { "name": "prime (Mind)", "path": "../prime" },
+    { "name": "reactor (Soul)", "path": "../reactor" }
+  ]
+}
