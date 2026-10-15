@@ -195,15 +195,19 @@ def _init_ml_components():
             _torch = torch_module
             _torchaudio = torchaudio_module
 
-            # CRITICAL: Enforce single-threaded mode on Apple Silicon
-            try:
-                if _torch.get_num_threads() != 1:
-                    _torch.set_num_threads(1)
-                if _torch.get_num_interop_threads() != 1:
-                    _torch.set_num_interop_threads(1)
-                logger.info("🍎 Apple Silicon - single-threaded PyTorch mode")
-            except RuntimeError:
-                pass
+            # CRITICAL: Enforce single-threaded mode on Apple Silicon. Only
+            # there: this ran on every host (logging "Apple Silicon" on
+            # AMD64 Windows, 2026-10-15) and set_num_threads is process-wide.
+            # Same gate as speechbrain_engine's identical block.
+            if _IS_APPLE_SILICON:
+                try:
+                    if _torch.get_num_threads() != 1:
+                        _torch.set_num_threads(1)
+                    if _torch.get_num_interop_threads() != 1:
+                        _torch.set_num_interop_threads(1)
+                    logger.info("🍎 Apple Silicon - single-threaded PyTorch mode")
+                except RuntimeError:
+                    pass
 
             # Patch torchaudio for SpeechBrain compatibility
             if not hasattr(_torchaudio, 'list_audio_backends'):
@@ -3569,8 +3573,11 @@ class SpeakerVerificationService:
         except Exception as e:
             logger.debug(f"Unified voice cache connection failed (non-critical): {e}")
 
-    def _is_system_under_preload_pressure(self) -> bool:
-        """Check if local background preload should be deferred under host pressure."""
+    def _is_system_under_preload_pressure(self) -> str:
+        """Why local background preload should wait, or "" when it need not.
+
+        Returns the measured reading that crossed its threshold (truthy), so
+        the deferral can say what it saw instead of asserting "pressure"."""
         try:
             import psutil
 
@@ -3578,10 +3585,15 @@ class SpeakerVerificationService:
             mem_now = psutil.virtual_memory().percent
             cpu_threshold = float(os.getenv("JARVIS_ENCODER_PRELOAD_CPU_MAX", "92.0"))
             mem_threshold = float(os.getenv("JARVIS_ENCODER_PRELOAD_MEM_MAX", "88.0"))
-            return cpu_now >= cpu_threshold or mem_now >= mem_threshold
+            reasons = []
+            if cpu_now >= cpu_threshold:
+                reasons.append(f"CPU {cpu_now:.0f}% >= {cpu_threshold:.0f}%")
+            if mem_now >= mem_threshold:
+                reasons.append(f"RAM {mem_now:.0f}% >= {mem_threshold:.0f}%")
+            return ", ".join(reasons)
         except Exception as e:
             logger.debug(f"Preload pressure check unavailable: {e}")
-            return False
+            return ""
 
     async def _defer_and_retry_preload(self) -> None:
         """Retry background preload after a configurable delay."""
@@ -3599,14 +3611,34 @@ class SpeakerVerificationService:
             self._deferred_preload_task = None
 
     def _start_background_preload(self):
-        """Start non-blocking encoder preload using cooperative asyncio tasks."""
+        """Start non-blocking encoder preload using cooperative asyncio tasks.
+
+        Preloads the SPEAKER ENCODER only. This used to call
+        `speechbrain_engine.initialize()` first, which loads the engine's ASR
+        model (wav2vec2, via HuggingFace transformers) — a model speaker
+        verification never calls: `verify_speaker` and
+        `extract_speaker_embedding` need only the ECAPA encoder. On an install
+        without transformers that ASR load is what failed
+        ("Lazy import of ... speechbrain.integrations.huggingface failed",
+        2026-10-15) and reported itself as an encoder preload failure, after
+        the encoder had already loaded.
+        """
+        engine = self.speechbrain_engine
+        if engine is not None and getattr(engine, "speaker_encoder_loaded", False):
+            # `_schedule_encoder_prewarm` already loaded it.
+            self._encoder_preloaded = True
         if self._encoder_preloading or self._encoder_preloaded:
             return
         if self._shutdown_event.is_set():
             logger.debug("Skipping preload: shutdown in progress")
             return
-        if self.speechbrain_engine is None:
+        if engine is None:
             logger.debug("Skipping preload: SpeechBrain engine not initialized")
+            return
+        prewarm = getattr(self, "_encoder_prewarm_task", None)
+        if prewarm is not None and not prewarm.done():
+            # One loader at a time: the pre-warm daemon owns this load.
+            logger.debug("Skipping preload: encoder pre-warm already in flight")
             return
 
         try:
@@ -3615,10 +3647,16 @@ class SpeakerVerificationService:
             logger.warning("Cannot start background preload: no running event loop")
             return
 
-        if self._is_system_under_preload_pressure():
+        pressure = self._is_system_under_preload_pressure()
+        if pressure:
             if self._deferred_preload_task is None or self._deferred_preload_task.done():
-                logger.warning(
-                    "⏳ Deferring local encoder preload due to system pressure; will retry in background"
+                # Expected, self-healing behaviour (a retry is scheduled and
+                # the unlock path still loads on demand): INFO, with the
+                # reading that caused it.
+                logger.info(
+                    "⏳ Deferring local encoder preload under host pressure (%s); "
+                    "retrying in background",
+                    pressure,
                 )
                 self._deferred_preload_task = loop.create_task(
                     self._defer_and_retry_preload(),
@@ -3630,17 +3668,9 @@ class SpeakerVerificationService:
 
         async def preload_worker() -> None:
             try:
-                logger.info("🔄 Background: Initializing SpeechBrain engine...")
-                await self.speechbrain_engine.initialize()
-                logger.info("✅ Background: SpeechBrain engine initialized")
-
-                if self._shutdown_event.is_set():
-                    logger.info("⏹️ Background preload cancelled during shutdown")
-                    return
-
                 logger.info("🔄 Background: Pre-loading speaker encoder...")
-                await self.speechbrain_engine.ensure_speaker_encoder_ready()
-                if self.speechbrain_engine.speaker_encoder_loaded:
+                await engine.ensure_speaker_encoder_ready()
+                if engine.speaker_encoder_loaded:
                     self._encoder_preloaded = True
                     logger.info("✅ Speaker encoder ready - voice biometric unlock now instant!")
                 else:
@@ -6114,7 +6144,8 @@ class SpeakerVerificationService:
                 model_path="speechbrain/asr-wav2vec2-commonvoice-en",
             )
             self.speechbrain_engine = _SpeechBrainEngine(model_config)
-            logger.warning("✅ SpeechBrain engine constructed — pre-warming encoder")
+            # Success is INFO; WARNING is reserved for what needs a look.
+            logger.info("✅ SpeechBrain engine constructed — pre-warming encoder")
             self._schedule_encoder_prewarm()
         except Exception as exc:  # noqa: BLE001
             # LOUD, with a traceback. A construction failure was previously
@@ -6178,7 +6209,19 @@ class SpeakerVerificationService:
                 await asyncio.wait_for(
                     engine.ensure_speaker_encoder_ready(), timeout=timeout_s
                 )
-                logger.warning(
+                if not getattr(engine, "speaker_encoder_loaded", False):
+                    # ensure_* returns quietly when a prior load task failed;
+                    # "ready" would be a claim the engine does not back.
+                    logger.warning(
+                        "⚠️ [EncoderPrewarm] load returned after %.1fs but the "
+                        "encoder is not loaded — lazy load remains available",
+                        _t.monotonic() - started,
+                    )
+                    return
+                # The background preloader reads this flag; without it, it
+                # re-checked host pressure for a load already done.
+                self._encoder_preloaded = True
+                logger.info(
                     "✅ [EncoderPrewarm] speaker encoder ready in %.1fs — the first "
                     "unlock will not pay for the model load",
                     _t.monotonic() - started,
