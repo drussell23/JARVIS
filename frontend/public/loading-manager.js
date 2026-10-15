@@ -54,18 +54,9 @@
  * - Retry button for frontend reconnection
  */
 
-// v225.0: Phase label mapping for v2 init_progress protocol timeline
-const PHASE_LABELS = {
-    'importing_ml_libraries': { short: 'ML', full: 'ML Libraries' },
-    'initializing_bridge': { short: 'Bridge', full: 'Bridge Init' },
-    'initializing_trinity': { short: 'Trinity', full: 'Trinity Sync' },
-    'initializing_agi_hub': { short: 'AGI', full: 'AGI Hub' },
-    'initializing_neural_orchestrator': { short: 'Neural', full: 'Neural Orch.' },
-    'resolving_model': { short: 'Model', full: 'Model Resolve' },
-    'configuring_hardware': { short: 'HW', full: 'Hardware Config' },
-    'loading_model': { short: 'Load', full: 'Model Loading' },
-    'marking_ready': { short: 'Ready', full: 'Finalizing' }
-};
+// Reports the supervisor sends whole with its progress (backend/loading_server.py
+// LoadingServer._REPORTS): the pre-flight checklist and the boot's phases.
+const SUPERVISOR_REPORTS = ['checklist', 'timeline'];
 
 class JARVISLoadingManager {
     constructor() {
@@ -2403,7 +2394,9 @@ class JARVISLoadingManager {
                                     components: inner.components || (inner.metadata || {}).components,
                                     trinity: inner.trinity || (inner.metadata || {}).trinity,
                                     trinity_ready: inner.trinity_ready ?? (inner.metadata || {}).trinity_ready,
-                                    init_progress: inner.init_progress || (inner.metadata || {}).init_progress  // v225.0: Prime v2 phase data
+                                    // The supervisor's reports, wherever the payload carries them.
+                                    ...Object.fromEntries(SUPERVISOR_REPORTS.map((key) => [
+                                        key, inner[key] ?? (inner.metadata || {})[key]])),
                                 }
                             };
                         } else {
@@ -2914,19 +2907,13 @@ class JARVISLoadingManager {
                 }
             }
 
-            // ===================================================================
-            // v225.0: Prime v2 init_progress Protocol Handler
-            // ===================================================================
-            const initProgress = metadata.init_progress;
-            if (initProgress && initProgress.protocol_version >= 2) {
-                this._v2Progress = {
-                    overallPct: initProgress.overall_pct,
-                    currentPhase: initProgress.current_phase,
-                    completedPhases: initProgress.completed_phases,
-                    totalPhases: initProgress.total_phases,
-                    phases: initProgress.phases || []
-                };
-                this.updatePhaseTimeline(this._v2Progress);
+            // The boot's phases (backend/core/boot_timeline.snapshot): the
+            // phase row. It used to wait for J-Prime's former Python server
+            // to report its own nine startup phases, which the J-Prime engine
+            // never does -- so it never lit.
+            const bootTimeline = data.timeline || metadata.timeline;
+            if (bootTimeline && Array.isArray(bootTimeline.phases)) {
+                this.renderBootTimeline(bootTimeline, stage === 'complete');
             }
 
             // v225.0: ETA Display from ML-based prediction
@@ -4301,46 +4288,50 @@ class JARVISLoadingManager {
         }
     }
 
-    // v225.0: Update phase timeline from v2 init_progress protocol data
-    updatePhaseTimeline(v2Data) {
-        const timeline = document.getElementById('phase-timeline');
+    /**
+     * The phase row, drawn from the supervisor's own boot timeline: each phase
+     * in the order boots run it -- done, running, or still to come (learned
+     * from previous boots) -- named as the terminal names it. The dots are
+     * rebuilt when the set of phases changes and restyled otherwise. At
+     * completion every phase is done.
+     */
+    renderBootTimeline(timeline, complete) {
+        const row = document.getElementById('phase-timeline');
         const fill = document.getElementById('timeline-fill');
-        if (!timeline || !fill) return;
-
-        // Update fill width based on completed phases
-        const completedPct = v2Data.totalPhases > 0
-            ? (v2Data.completedPhases / v2Data.totalPhases) * 100
-            : 0;
-        fill.style.width = `${completedPct}%`;
-
-        // Update individual dot wrappers (wrapper carries active/completed class for CSS)
-        const wrappers = timeline.querySelectorAll('.timeline-dot-wrapper');
-        const phaseNames = Object.keys(PHASE_LABELS);
-
-        wrappers.forEach((wrapper, i) => {
+        if (!row || !fill) return;
+        const phases = timeline.phases.filter((phase) => phase && phase.name);
+        const key = phases.map((phase) => phase.name).join('|');
+        if (row.dataset.phases !== key) {
+            row.querySelectorAll('.timeline-dot-wrapper').forEach((el) => el.remove());
+            phases.forEach((phase) => {
+                const wrapper = document.createElement('div');
+                wrapper.className = 'timeline-dot-wrapper';
+                wrapper.dataset.phase = phase.name;
+                const dot = document.createElement('div');
+                dot.className = 'timeline-dot';
+                const label = document.createElement('span');
+                label.className = 'timeline-label';
+                label.textContent = phase.title || phase.name;
+                wrapper.append(dot, label);
+                row.appendChild(wrapper);
+            });
+            row.dataset.phases = key;
+        }
+        let done = 0;
+        phases.forEach((phase) => {
+            const wrapper = row.querySelector(`.timeline-dot-wrapper[data-phase="${CSS.escape(phase.name)}"]`);
+            if (!wrapper) return;
+            const state = complete ? 'done' : phase.state;
             const dot = wrapper.querySelector('.timeline-dot');
-            if (!dot) return;
-
-            // Reset classes
-            wrapper.classList.remove('active', 'completed');
-            dot.className = 'timeline-dot';
-
-            if (i < v2Data.completedPhases) {
-                wrapper.classList.add('completed');
-                dot.classList.add('completed');
-            } else if (i === v2Data.completedPhases) {
-                wrapper.classList.add('active');
-                dot.classList.add('active');
-            }
-
-            // Update tooltip with detailed phase data
-            if (v2Data.phases && v2Data.phases[i]) {
-                const phaseData = v2Data.phases[i];
-                const phaseName = phaseNames[i] || `Phase ${i + 1}`;
-                const label = PHASE_LABELS[phaseName];
-                wrapper.title = `${label ? label.full : phaseName}: ${phaseData.status || 'pending'}`;
-            }
+            wrapper.classList.toggle('completed', state === 'done');
+            wrapper.classList.toggle('active', state === 'running');
+            dot.classList.toggle('completed', state === 'done');
+            dot.classList.toggle('active', state === 'running');
+            if (state === 'done') done += 1;
+            const took = typeof phase.seconds === 'number' ? ` (${phase.seconds}s)` : '';
+            wrapper.title = `${phase.title || phase.name}: ${state}${took}`;
         });
+        fill.style.width = `${phases.length ? (done / phases.length) * 100 : 0}%`;
     }
 
     updateStatusText(text, status) {

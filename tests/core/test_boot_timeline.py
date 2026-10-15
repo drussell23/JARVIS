@@ -117,3 +117,40 @@ def test_the_page_shows_the_timeline_not_a_literal_written_elsewhere(tmp_path):
     k = types.SimpleNamespace(_boot_timeline=timeline, _current_progress=57)
     measured = us.JarvisSystemKernel._measured_boot_percent(k)
     assert measured == timeline.percent() and measured < 57
+
+
+# The loading page's phase row is drawn from this (2026-10-15: it was nine
+# fixed dots for J-Prime's former Python server's phases and never lit).
+def test_the_snapshot_is_the_boots_phases_done_running_and_to_come(tmp_path):
+    store = tmp_path / "t.json"
+    _learn(store, {"clean_slate:start": 0, "clean_slate:end": 8, "preflight:start": 9,
+                   "preflight:end": 25, "trinity:start": 37, "trinity:end": 42}, total=60)
+    t = BootTimeline(origin=0.0, store=store)
+    t.phase_started("clean_slate", 0)
+    t.phase_ended("clean_slate", 7.5)
+    t.phase_started("preflight", 9)
+    snap = t.snapshot(now=12)
+    assert [(p["name"], p["title"], p["state"]) for p in snap["phases"]] == [
+        ("clean_slate", "Clean slate", "done"),
+        ("preflight", "Preflight", "running"),
+        ("trinity", "Trinity", "upcoming"),        # learned from previous boots
+    ]
+    assert snap["phases"][0]["seconds"] == 7.5 and snap["phases"][1]["seconds"] == 3.0
+    assert not snap["complete"] and not snap["learning"] and 0 < snap["percent"] < 100
+
+
+def test_a_completed_boot_lists_nothing_still_to_come(tmp_path):
+    t = BootTimeline(origin=0.0, store=tmp_path / "t.json")
+    t.phase_started("preflight", 1)
+    t.phase_ended("preflight", 2)
+    t.completed(3)
+    snap = t.snapshot(now=10)
+    assert [p["state"] for p in snap["phases"]] == ["done"]
+    assert snap["complete"] and snap["percent"] == 100 and snap["elapsed"] == 3.0
+
+
+def test_a_first_boot_shows_only_what_it_has_seen(tmp_path):
+    t = BootTimeline(origin=0.0, store=tmp_path / "t.json")
+    t.phase_started("clean_slate", 1)
+    snap = t.snapshot(now=2)
+    assert snap["learning"] and [p["name"] for p in snap["phases"]] == ["clean_slate"]

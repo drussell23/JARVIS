@@ -157,3 +157,22 @@ async def test_supervisor_recovery_status_route_is_available(loading_server, mon
 
     assert payload["controller"] == "supervisor_recovery"
     assert "recovery_process_running" in payload
+
+
+@pytest.mark.asyncio
+async def test_supervisor_reports_reach_the_page_whole_not_as_components(loading_server):
+    """The checklist and the boot's phases are reports relayed as they were
+    sent; folded into the components map they never reached the page."""
+    timeline = {"phases": [{"name": "preflight", "title": "Preflight", "state": "running"}],
+                "percent": 30, "learning": False, "complete": False, "elapsed": 12.0}
+    checklist = {"verdict": "ready", "items": []}
+    body = json.dumps({"stage": "preflight", "message": "m", "progress": 30,
+                       "metadata": {"icon": "spinner", "timeline": timeline, "checklist": checklist}})
+    await loading_server._handle_progress_update(body.encode())
+    assert "timeline" not in loading_server._components
+    assert "checklist" not in loading_server._components
+    assert loading_server._reports == {"timeline": timeline, "checklist": checklist}
+    # A later message without a report keeps the last one.
+    await loading_server._handle_progress_update(json.dumps(
+        {"stage": "preflight", "message": "m", "progress": 31, "metadata": {"icon": "spinner"}}).encode())
+    assert loading_server._reports["timeline"] == timeline

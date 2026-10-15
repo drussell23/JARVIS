@@ -1676,48 +1676,13 @@
 
         <!-- Detailed status panel will be dynamically inserted here with order: 7 -->
 
-        <!-- v225.0: Phase Timeline (replaces flat stage grid) -->
+        <!-- The boot's phases, drawn from the supervisor's boot timeline
+             (loading-manager.js renderBootTimeline; backend/core/boot_timeline.py). -->
         <div class="phase-timeline" id="phase-timeline" style="order: 8;">
             <div class="timeline-track-wrapper">
                 <div class="timeline-track">
                     <div class="timeline-fill" id="timeline-fill"></div>
                 </div>
-            </div>
-            <div class="timeline-dot-wrapper" data-phase="importing_ml_libraries">
-                <div class="timeline-dot"></div>
-                <span class="timeline-label">ML</span>
-            </div>
-            <div class="timeline-dot-wrapper" data-phase="initializing_bridge">
-                <div class="timeline-dot"></div>
-                <span class="timeline-label">Bridge</span>
-            </div>
-            <div class="timeline-dot-wrapper" data-phase="initializing_trinity">
-                <div class="timeline-dot"></div>
-                <span class="timeline-label">Trinity</span>
-            </div>
-            <div class="timeline-dot-wrapper" data-phase="initializing_agi_hub">
-                <div class="timeline-dot"></div>
-                <span class="timeline-label">AGI</span>
-            </div>
-            <div class="timeline-dot-wrapper" data-phase="initializing_neural_orchestrator">
-                <div class="timeline-dot"></div>
-                <span class="timeline-label">Neural</span>
-            </div>
-            <div class="timeline-dot-wrapper" data-phase="resolving_model">
-                <div class="timeline-dot"></div>
-                <span class="timeline-label">Model</span>
-            </div>
-            <div class="timeline-dot-wrapper" data-phase="configuring_hardware">
-                <div class="timeline-dot"></div>
-                <span class="timeline-label">HW</span>
-            </div>
-            <div class="timeline-dot-wrapper" data-phase="loading_model">
-                <div class="timeline-dot"></div>
-                <span class="timeline-label">Load</span>
-            </div>
-            <div class="timeline-dot-wrapper" data-phase="marking_ready">
-                <div class="timeline-dot"></div>
-                <span class="timeline-label">Ready</span>
             </div>
         </div>
 

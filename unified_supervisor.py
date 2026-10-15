@@ -89738,6 +89738,16 @@ class JarvisSystemKernel:
         # Single clamp point - enforce progress bounds
         progress = min(100, max(0, progress))
 
+        # The boot's phases ride on every message (backend/core/boot_timeline
+        # snapshot): the loading page's phase row is drawn from them, one
+        # attach point for the heartbeat, phase updates and completion.
+        timeline = getattr(self, "_boot_timeline", None)
+        if timeline is not None:
+            try:
+                metadata = {**(metadata or {}), "timeline": timeline.snapshot()}
+            except Exception as _tl_err:  # noqa: BLE001 -- the message still goes
+                self.logger.debug(f"[Broadcast] boot timeline unreadable: {_tl_err}")
+
         # v272.x Phase 10: Suppress duplicate broadcasts within dedup window
         _bcast_dedup_key = f"{stage}:{progress}"
         _bcast_dedup_window = float(os.environ.get("JARVIS_BROADCAST_DEDUP_WINDOW", "2.0"))

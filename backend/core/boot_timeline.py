@@ -191,6 +191,33 @@ class BootTimeline:
                              if key.endswith(":start"))
         return [name for _, name in learned if name not in started]
 
+    def snapshot(self, now: Optional[float] = None) -> Dict[str, object]:
+        """The boot as a page shows it: every phase in the order boots run
+        them -- done (with its time), running (with its time so far), or
+        still to come (learned from previous boots) -- named as the terminal
+        names them (console_view.phase_title), with the position and
+        whether it is still learning. The loading page's phase row used to
+        be nine fixed dots for the startup phases of J-Prime's former
+        Python server; the J-Prime engine reports none of them, so the row
+        never lit (2026-10-15)."""
+        from backend.core.console_view import phase_title
+
+        now = time.time() if now is None else now
+        elapsed = self.elapsed(now)
+        rows: List[Dict[str, object]] = []
+        for name, started, ended in self.phases():
+            done = ended is not None
+            rows.append({
+                "name": name, "title": phase_title(name),
+                "state": "done" if done else "running",
+                "seconds": round((ended if done else elapsed) - started, 1),
+            })
+        if not self.complete:
+            rows += [{"name": name, "title": phase_title(name), "state": "upcoming"}
+                     for name in self.upcoming()]
+        return {"phases": rows, "percent": self.percent(now), "learning": self.learning,
+                "complete": self.complete, "elapsed": round(elapsed, 1)}
+
     def elapsed(self, now: Optional[float] = None) -> float:
         """Seconds since the boot began; frozen at completion."""
         with self._lock:

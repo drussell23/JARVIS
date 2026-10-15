@@ -1119,6 +1119,9 @@ class LoadingServer:
     - Trinity Heartbeat Monitoring
     - Parent Death Watcher (v211.0)
     """
+    #: Supervisor reports relayed to the page whole (not folded into components):
+    #: the pre-flight checklist and the boot's phases.
+    _REPORTS = ("checklist", "timeline")
 
     def __init__(self, config: Optional[LoadingServerConfig] = None):
         self.config = config or get_config()
@@ -1137,7 +1140,7 @@ class LoadingServer:
         self._components: Dict[str, Dict[str, Any]] = {}
         self._startup_timeout_ms: Optional[int] = None  # v270.2: Backend-negotiated startup timeout
         self._completion_metadata: Optional[Dict[str, Any]] = None  # v351.0: Authoritative completion metadata
-        self._checklist: Optional[Dict[str, Any]] = None  # the pre-flight checklist report
+        self._reports: Dict[str, Any] = {}  # the reports in _REPORTS, as last sent
         self._shutdown_requested = False
         self._stopping = False
         self._server: Optional[asyncio.Server] = None
@@ -1180,9 +1183,6 @@ class LoadingServer:
         # v185.0: Trinity summary from supervisor broadcasts
         self._trinity_summary: Optional[Dict[str, Any]] = None
         self._trinity_ready: bool = False
-
-        # v225.0: Prime v2 init_progress protocol data
-        self._prime_init_progress: Optional[Dict[str, Any]] = None
 
         # v271.2: Degraded completion metadata from supervisor
         self._frontend_failed: bool = False
@@ -1347,7 +1347,6 @@ class LoadingServer:
                 "trinity": self._trinity_summary,  # v185.0: Trinity component summary
                 "trinity_ready": self._trinity_ready,  # v185.0: Trinity ready flag
                 "ghost_display": ghost_display_data,  # v129.0: Ghost display status
-                "init_progress": self._prime_init_progress,  # v225.0: Prime v2 phase data
                 "sequence": sequence,  # v186.0/v212.0: Sequence for detecting missed updates
                 "session_id": self._session_id,  # v212.0: Session correlation
                 "trace_id": self._trace_context.trace_id if self._trace_context else None,
@@ -1356,8 +1355,7 @@ class LoadingServer:
         # v270.2: Include backend-negotiated startup timeout for frontend negotiation
         if self._startup_timeout_ms is not None:
             ws_data["startup_timeout_ms"] = self._startup_timeout_ms
-        if self._checklist is not None:
-            ws_data["checklist"] = self._checklist
+        ws_data.update(self._reports)
         # v351.0: Include authoritative completion metadata so frontend
         # takes the fast-path (skip /health/ready re-verification).
         if self._completion_metadata is not None:
@@ -2021,7 +2019,7 @@ class LoadingServer:
             "components": self._components,
             "trinity": self._trinity_summary,  # v185.0: Trinity component summary
             "trinity_ready": self._trinity_ready,  # v185.0: Trinity ready flag
-            "init_progress": self._prime_init_progress,  # v225.0: Prime v2 phase data
+            **self._reports,
             "dependency_graph": self._dependency_graph.get_progress(),
             "sequence": self._sequence_number,  # v186.0: Sequence for tracking
             "timestamp": datetime.now().isoformat(),
@@ -2327,26 +2325,24 @@ class LoadingServer:
             if "metadata" in data:
                 metadata = data["metadata"]
                 # If metadata contains a 'components' key, extract and use it
-                # The pre-flight checklist is a report of its own (backend/
-                # core/flight_check), relayed whole -- not a component.
-                if "checklist" in metadata:
-                    self._checklist = metadata["checklist"]
+                # Reports of their own, relayed whole -- not components: the
+                # pre-flight checklist (backend/core/flight_check) and the
+                # boot's phases (backend/core/boot_timeline.snapshot).
+                for _report in self._REPORTS:
+                    if metadata.get(_report) is not None:
+                        self._reports[_report] = metadata[_report]
                 if "components" in metadata:
                     self._components = metadata["components"]
                 else:
                     # Legacy format: metadata IS the components dict
                     self._components.update(
-                        {k: v for k, v in metadata.items() if k != "checklist"})
+                        {k: v for k, v in metadata.items() if k not in self._REPORTS})
                 
                 # v185.0: Persist Trinity summary from supervisor broadcasts
                 if "trinity" in metadata:
                     self._trinity_summary = metadata["trinity"]
                 if "trinity_ready" in metadata:
                     self._trinity_ready = metadata["trinity_ready"]
-
-                # v225.0: Persist Prime v2 init_progress protocol data
-                if "init_progress" in metadata:
-                    self._prime_init_progress = metadata["init_progress"]
 
                 # v270.2: Persist backend-negotiated startup timeout for frontend negotiation
                 if "startup_timeout_ms" in metadata:
