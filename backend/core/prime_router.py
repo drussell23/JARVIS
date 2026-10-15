@@ -580,23 +580,31 @@ class PrimeRouter:
     async def _resolve_unknown_prime_status(self, deadline: Optional[float]) -> None:
         """Probe J-Prime once if its availability has never been established.
 
-        Bounded by JARVIS_PRIME_STATUS_PROBE_S (default 2 s) and by the
-        request's own deadline; any failure leaves the status as it was.
+        The probe is part of the request, so it shares the request's own
+        deadline: a J-Prime that is down refuses the connection at once, and
+        one that is slow to answer is alive and busy -- a fixed 2 s cap
+        (smaller than any generation the request was willing to wait for)
+        timed out under boot-time load and routed a live model as "down"
+        (2026-10-14, the pre-flight checklist). Without a deadline,
+        JARVIS_PRIME_STATUS_PROBE_S (default 2 s) bounds it. Any failure
+        leaves the status as it was.
         """
         client = self._prime_client
         if client is None or getattr(client, "_status", None) is None:
             return
         if getattr(client._status, "name", "") != "UNKNOWN":
             return
-        budget = float(os.environ.get("JARVIS_PRIME_STATUS_PROBE_S", "2.0"))
         if deadline is not None:
-            budget = min(budget, max(0.0, deadline - asyncio.get_event_loop().time()))
+            budget = max(0.0, deadline - time.monotonic())
+        else:
+            budget = float(os.environ.get("JARVIS_PRIME_STATUS_PROBE_S", "2.0"))
         if budget <= 0:
             return
         try:
             await asyncio.wait_for(client._check_health(), timeout=budget)
         except Exception as exc:  # noqa: BLE001 -- the route decision handles "unknown"
-            logger.debug("[PrimeRouter] status probe failed: %s", exc)
+            logger.info("[PrimeRouter] J-Prime status probe failed (%s): %s",
+                        type(exc).__name__, exc)
 
     def _decide_route(self) -> RoutingDecision:
         """Pillar 5: Route to J-Prime (the Mind). Always.

@@ -3420,6 +3420,24 @@ class JARVISLoadingManager {
             return;
         }
 
+        // The pre-flight checklist (backend/core/flight_check): each item as
+        // the terminal calls it out -- passed, needs attention, or failing.
+        // Called out once per checklist run (every later update repeats it).
+        const checklist = data.checklist || metadata.checklist;
+        const checklistKey = checklist ? JSON.stringify(checklist.items || []) : null;
+        if (checklist && Array.isArray(checklist.items) && checklistKey !== this.state.checklistShown) {
+            this.state.checklistShown = checklistKey;
+            this.addLogEntry('Pre-flight',
+                `Checklist ${String(checklist.verdict || '').replace('_', ' ')}`,
+                checklist.verdict === 'ready' ? 'success' : 'warning');
+            checklist.items.forEach((item) => {
+                const passed = item.status === 'go' || item.status === 'skipped';
+                const level = passed ? 'success' : (item.required ? 'error' : 'warning');
+                const remedy = !passed && item.remedy ? ` (${item.remedy})` : '';
+                this.addLogEntry('Pre-flight', `${item.title}: ${item.detail}${remedy}`, level);
+            });
+        }
+
         // Log stage transitions automatically
         if (stage && stage !== this.state.stage && message) {
             const source = stage.includes('supervisor') ? 'Supervisor' :

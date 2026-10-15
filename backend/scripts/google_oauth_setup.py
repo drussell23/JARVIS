@@ -34,23 +34,14 @@ def _rule(title: str = "") -> None:
 
 
 async def _verify(client) -> bool:
-    """Read once through each service with the new sign-in."""
-    checks = (
-        ("Gmail", client.fetch_unread_emails(limit=5), lambda r: f"{r.get('count', len(r.get('emails', [])))} unread"),
-        ("Calendar", client.get_calendar_events(days=1), lambda r: f"{len(r.get('events', []))} event(s) today"),
-        ("Contacts", client.get_contacts(limit=5), lambda r: f"{len(r.get('contacts', []))} contact(s) read"),
-    )
+    """Read once through each service with the new sign-in (the workspace
+    agent's verify_workspace -- the pre-flight checklist reads the same)."""
+    from backend.neural_mesh.agents.google_workspace_agent import verify_workspace
+
     ok = True
-    for name, call, describe in checks:
-        try:
-            result = await call
-        except Exception as exc:  # noqa: BLE001 -- report each service on its own
-            result = {"error": str(exc)}
-        if isinstance(result, dict) and result.get("error"):
-            ok = False
-            print(f"    {name:<9} FAILED - {result['error']}")
-        else:
-            print(f"    {name:<9} {describe(result if isinstance(result, dict) else {})}")
+    for name, passed, detail in await verify_workspace(client):
+        ok = ok and passed
+        print(f"    {name:<9} {detail if passed else 'FAILED - ' + detail}")
     return ok
 
 

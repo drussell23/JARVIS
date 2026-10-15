@@ -1137,6 +1137,7 @@ class LoadingServer:
         self._components: Dict[str, Dict[str, Any]] = {}
         self._startup_timeout_ms: Optional[int] = None  # v270.2: Backend-negotiated startup timeout
         self._completion_metadata: Optional[Dict[str, Any]] = None  # v351.0: Authoritative completion metadata
+        self._checklist: Optional[Dict[str, Any]] = None  # the pre-flight checklist report
         self._shutdown_requested = False
         self._stopping = False
         self._server: Optional[asyncio.Server] = None
@@ -1355,6 +1356,8 @@ class LoadingServer:
         # v270.2: Include backend-negotiated startup timeout for frontend negotiation
         if self._startup_timeout_ms is not None:
             ws_data["startup_timeout_ms"] = self._startup_timeout_ms
+        if self._checklist is not None:
+            ws_data["checklist"] = self._checklist
         # v351.0: Include authoritative completion metadata so frontend
         # takes the fast-path (skip /health/ready re-verification).
         if self._completion_metadata is not None:
@@ -2324,11 +2327,16 @@ class LoadingServer:
             if "metadata" in data:
                 metadata = data["metadata"]
                 # If metadata contains a 'components' key, extract and use it
+                # The pre-flight checklist is a report of its own (backend/
+                # core/flight_check), relayed whole -- not a component.
+                if "checklist" in metadata:
+                    self._checklist = metadata["checklist"]
                 if "components" in metadata:
                     self._components = metadata["components"]
                 else:
                     # Legacy format: metadata IS the components dict
-                    self._components.update(metadata)
+                    self._components.update(
+                        {k: v for k, v in metadata.items() if k != "checklist"})
                 
                 # v185.0: Persist Trinity summary from supervisor broadcasts
                 if "trinity" in metadata:

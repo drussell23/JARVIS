@@ -66985,6 +66985,49 @@ class JarvisSystemKernel:
             *(asyncio.to_thread(probe_health, t) for t in targets)
         ))
 
+    async def _run_flight_check(self) -> Optional[Any]:
+        """The pre-flight checklist (backend/core/flight_check), run before
+        readiness is declared: every capability the user relies on is
+        exercised, and the services this kernel supervises are measured once
+        more as items of the same report. Called out line by line in the
+        terminal and sent to the loading page; the report is what readiness,
+        the completion line and the loading page's last message stand on.
+        None when disabled (JARVIS_FLIGHT_CHECK_ENABLED) or unreadable."""
+        from backend.core import flight_check
+        from backend.core.console_view import narrate, seconds
+
+        if not flight_check.enabled():
+            return None
+        self._mark_startup_activity("preflight_checklist")
+        narrate("Pre-flight checklist", "note")
+        try:
+            readings = await self._measure_component_health()
+        except Exception as exc:  # noqa: BLE001 -- the checklist still runs its own items
+            self.logger.debug(f"[FlightCheck] service health unreadable: {exc}")
+            readings = []
+        try:
+            report = await flight_check.run(
+                flight_check.health_item(r, required=(r.name == "jarvis")) for r in readings)
+        except Exception as exc:  # noqa: BLE001 -- no report: nothing may be claimed from one
+            self.logger.warning(f"[FlightCheck] checklist could not run: {exc}")
+            return None
+        for tone, text, suffix in flight_check.lines(report):
+            narrate(text, tone, suffix=suffix)
+        narrate(f"Checklist {report.verdict.replace('_', ' ')}: {report.summary()}",
+                "done" if report.verdict == "ready" else "failed",
+                suffix=seconds(report.elapsed_s))
+        try:
+            await self._safe_broadcast(
+                stage="preflight_checklist",
+                message=f"Pre-flight checklist: {report.summary()}",
+                progress=self._current_startup_progress,
+                metadata={"icon": "check", "phase": "preflight_checklist",
+                          "checklist": report.as_dict()},
+            )
+        except Exception:
+            pass
+        return report
+
     @staticmethod
     def _spoken_component(reading: Any) -> str:
         return reading.display_name.split(" (")[0]
@@ -71848,6 +71891,10 @@ class JarvisSystemKernel:
                         f"(phase={_ssm.phase.value})"
                     )
 
+            # The pre-flight checklist: what the user relies on, exercised,
+            # before anything is declared ready (backend/core/flight_check).
+            flight_report = await self._run_flight_check()
+
             self._mark_startup_activity("readiness_evaluation")  # v278.1
             readiness_is_fully_ready = True  # Default to True for fallback
             readiness_message = "System ready (predicate evaluation unavailable)"
@@ -71868,6 +71915,18 @@ class JarvisSystemKernel:
                         f"[Readiness] Predicate evaluation failed: {e}"
                     )
                     # Fall through to default (True) - don't block startup due to predicate errors
+
+            # A required checklist item that failed holds the tier below fully
+            # ready, whatever the component states said; optional ones are
+            # degraded. The checklist exercised them -- the states did not.
+            if flight_report is not None:
+                if flight_report.blocking:
+                    readiness_is_fully_ready = False
+                    readiness_message = f"Pre-flight checklist: {flight_report.summary()}"
+                blocking_components = list(dict.fromkeys(
+                    [*blocking_components, *flight_report.blocking]))
+                degraded_components = list(dict.fromkeys(
+                    [*degraded_components, *flight_report.degraded]))
 
             # Mark as running with appropriate readiness tier
             self._state = self._lifecycle_engine.transition(
@@ -71936,9 +71995,17 @@ class JarvisSystemKernel:
             # JARVIS_STARTUP_COMPLETE=true, governance online, agents wired.
             # The loading page will redirect ONLY after this + quickBackendCheck(/health/ready).
             try:
+                # What the checklist found, not a fixed line: online, online
+                # with what is not working, or up but not ready.
+                if flight_report is None or flight_report.verdict == "ready":
+                    _online_message = "JARVIS is online!"
+                elif flight_report.verdict == "limited":
+                    _online_message = f"JARVIS is online -- {flight_report.summary()}"
+                else:
+                    _online_message = f"JARVIS is up but not ready -- {flight_report.summary()}"
                 await self._safe_broadcast(
                     stage="complete",
-                    message="JARVIS is online!",
+                    message=_online_message,
                     progress=100,
                     metadata={
                         "icon": "check",
@@ -71946,6 +72013,9 @@ class JarvisSystemKernel:
                         "final": True,
                         "supervisor_verified": True,
                         "authority": "unified_supervisor",
+                        "checklist": flight_report.as_dict() if flight_report is not None else None,
+                        "blocking_components": blocking_components,
+                        "degraded_components": degraded_components,
                     },
                 )
             except Exception:
@@ -71972,11 +72042,16 @@ class JarvisSystemKernel:
             # so the user sees a clean dashboard only when JARVIS is fully online.
             if getattr(self, "_lifecycle_narrator", None) is not None:
                 try:
-                    try:
-                        _issues = self._health_issues(await self._measure_component_health())
-                    except Exception as _hc_err:  # noqa: BLE001 -- unmeasured: no "all systems"
-                        self.logger.debug(f"[Kernel] completion health unreadable: {_hc_err}")
-                        _issues = None
+                    if flight_report is not None:
+                        # The checklist's findings: the same report the
+                        # terminal and the loading page showed.
+                        _issues = flight_report.issues_spoken()
+                    else:
+                        try:
+                            _issues = self._health_issues(await self._measure_component_health())
+                        except Exception as _hc_err:  # noqa: BLE001 -- unmeasured: no "all systems"
+                            self.logger.debug(f"[Kernel] completion health unreadable: {_hc_err}")
+                            _issues = None
                     _timeline = getattr(self, "_boot_timeline", None)
                     self._lifecycle_narrator.narrate_startup_complete(
                         _timeline.elapsed() if _timeline is not None else startup_duration,

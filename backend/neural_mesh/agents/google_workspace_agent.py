@@ -785,6 +785,31 @@ def _oauth_setup_command() -> str:
 OAUTH_SETUP_COMMAND = _oauth_setup_command()
 
 
+async def verify_workspace(client: Any) -> List[Tuple[str, bool, str]]:
+    """Read once through each service with *client*'s sign-in:
+    ``(service, ok, what was read or why not)``, the services read
+    concurrently. The one verification for the sign-in script and the
+    pre-flight checklist (backend/core/flight_check)."""
+    checks = (
+        ("Gmail", client.fetch_unread_emails(limit=5),
+         lambda r: f"{r.get('count', len(r.get('emails', [])))} unread"),
+        ("Calendar", client.get_calendar_events(days=1),
+         lambda r: f"{len(r.get('events', []))} event(s) today"),
+        ("Contacts", client.get_contacts(limit=5),
+         lambda r: f"{len(r.get('contacts', []))} contact(s) read"),
+    )
+    results = await asyncio.gather(*(call for _, call, _ in checks), return_exceptions=True)
+    verified: List[Tuple[str, bool, str]] = []
+    for (name, _, describe), result in zip(checks, results):
+        if isinstance(result, BaseException):
+            verified.append((name, False, f"{type(result).__name__}: {result}"))
+        elif isinstance(result, dict) and result.get("error"):
+            verified.append((name, False, str(result["error"])))
+        else:
+            verified.append((name, True, describe(result if isinstance(result, dict) else {})))
+    return verified
+
+
 GOOGLE_WORKSPACE_SCOPES = [
     # Gmail
     'https://www.googleapis.com/auth/gmail.readonly',
