@@ -1412,9 +1412,7 @@ class JARVISLoadingManager {
 
         // Create log entry
         const entry = document.createElement('div');
-        // Its level (info / success / warning / error) styles it too: the
-        // argument was taken and never applied, so every line looked alike.
-        entry.className = `log-entry ${sourceClass} ${type}`;
+        entry.className = `log-entry ${sourceClass}`;
         entry.innerHTML = `
             <span class="log-time">${timeStr}</span>
             <span class="log-source">${source.substring(0, 12)}</span>
@@ -3416,7 +3414,6 @@ class JARVISLoadingManager {
         const checklistKey = checklist ? JSON.stringify(checklist.items || []) : null;
         if (checklist && Array.isArray(checklist.items) && checklistKey !== this.state.checklistShown) {
             this.state.checklistShown = checklistKey;
-            this.renderChecklist(checklist);
             this.addLogEntry('Pre-flight',
                 `Checklist ${String(checklist.verdict || '').replace('_', ' ')}`,
                 checklist.verdict === 'ready' ? 'success' : 'warning');
@@ -4262,58 +4259,33 @@ class JARVISLoadingManager {
         this.elements.progressBar.style.width = `${displayProgress}%`;
         this.elements.progressPercentage.textContent = `${displayProgress}%`;
 
-        // The ring around the reactor: its length is measured from its own
-        // geometry, and its glow grows through --progress (loading.html
-        // styles both from the theme -- no colour is chosen here).
+        // Phase-based color
+        if (displayProgress < 40) {
+            // Cleanup phase - orange
+            this.elements.progressBar.style.background = 'linear-gradient(90deg, #ff8800 0%, #ffaa00 100%)';
+        } else if (displayProgress < 50) {
+            // Starting phase - blue
+            this.elements.progressBar.style.background = 'linear-gradient(90deg, #0088ff 0%, #00aaff 100%)';
+        } else if (displayProgress < 95) {
+            // Initialization phase - green
+            this.elements.progressBar.style.background = 'linear-gradient(90deg, #00aa44 0%, #00ff41 100%)';
+        } else {
+            // Ready/Complete phase - bright green with glow
+            this.elements.progressBar.style.background = 'linear-gradient(90deg, #00ff41 0%, #00ff88 100%)';
+            this.elements.progressBar.style.boxShadow = '0 0 20px rgba(0, 255, 65, 0.8)';
+        }
+
+        // v225.0: Update SVG circular progress ring around arc reactor
         const ring = document.getElementById('progress-ring-fill');
         if (ring) {
-            const circumference = 2 * Math.PI * ring.r.baseVal.value;
-            ring.style.strokeDasharray = `${circumference}`;
-            ring.style.strokeDashoffset = `${circumference * (1 - displayProgress / 100)}`;
-            ring.style.setProperty('--progress', `${displayProgress / 100}`);
-        }
-    }
+            const circumference = 597; // 2 * Math.PI * 95 ≈ 597
+            const offset = circumference - (displayProgress / 100) * circumference;
+            ring.style.strokeDashoffset = offset;
 
-    /**
-     * The pre-flight checklist panel (backend/core/flight_check): one row per
-     * item -- its status chip, what was found, and the fix when it needs
-     * one -- under the run's verdict. Built with text nodes only: the details
-     * come from the backend and are never interpreted as markup.
-     */
-    renderChecklist(checklist) {
-        const panel = document.getElementById('checklist-panel');
-        const list = document.getElementById('checklist-items');
-        const verdict = document.getElementById('checklist-verdict');
-        if (!panel || !list) return;
-        const STATUS_LABEL = { go: 'Go', limited: 'Attn', no_go: 'Fail', skipped: 'Skip' };
-        const VERDICT_LABEL = { ready: 'Ready', limited: 'Limited', not_ready: 'Not ready' };
-        const rows = checklist.items.map((item) => {
-            const row = document.createElement('li');
-            row.className = 'checklist-item';
-            const chip = document.createElement('span');
-            chip.className = `chip ${item.status}`;
-            chip.textContent = STATUS_LABEL[item.status] || item.status;
-            const title = document.createElement('span');
-            title.className = 'checklist-title';
-            title.textContent = item.required ? item.title : `${item.title} (optional)`;
-            const detail = document.createElement('span');
-            detail.className = 'checklist-detail';
-            detail.textContent = item.detail || '';
-            row.append(chip, title, detail);
-            if (item.remedy && item.status !== 'go' && item.status !== 'skipped') {
-                const remedy = document.createElement('span');
-                remedy.className = 'checklist-remedy';
-                remedy.textContent = item.remedy;
-                row.append(remedy);
-            }
-            return row;
-        });
-        list.replaceChildren(...rows);
-        if (verdict) {
-            verdict.className = `chip ${checklist.verdict}`;
-            verdict.textContent = VERDICT_LABEL[checklist.verdict] || checklist.verdict || '';
+            // Intensify glow as progress increases
+            const glowIntensity = 4 + (displayProgress / 100) * 12;
+            ring.style.filter = `drop-shadow(0 0 ${glowIntensity}px rgba(0, 255, 65, ${0.4 + displayProgress / 200}))`;
         }
-        panel.hidden = false;
     }
 
     /**
@@ -4340,9 +4312,7 @@ class JARVISLoadingManager {
                 const label = document.createElement('span');
                 label.className = 'timeline-label';
                 label.textContent = phase.title || phase.name;
-                const meta = document.createElement('span');
-                meta.className = 'timeline-meta';
-                wrapper.append(dot, label, meta);
+                wrapper.append(dot, label);
                 row.appendChild(wrapper);
             });
             row.dataset.phases = key;
@@ -4358,19 +4328,10 @@ class JARVISLoadingManager {
             dot.classList.toggle('completed', state === 'done');
             dot.classList.toggle('active', state === 'running');
             if (state === 'done') done += 1;
-            const took = typeof phase.seconds === 'number' ? `${phase.seconds.toFixed(1)}s` : '';
-            wrapper.querySelector('.timeline-meta').textContent =
-                state === 'upcoming' ? 'queued' : took;
-            wrapper.title = `${phase.title || phase.name}: ${state}${took ? ` (${took})` : ''}`;
+            const took = typeof phase.seconds === 'number' ? ` (${phase.seconds}s)` : '';
+            wrapper.title = `${phase.title || phase.name}: ${state}${took}`;
         });
-        // The track runs down the rows: filled through the last done phase.
-        fill.style.height = `${phases.length ? (done / phases.length) * 100 : 0}%`;
-        const meta = document.getElementById('sequence-meta');
-        if (meta) {
-            const elapsed = typeof timeline.elapsed === 'number' ? `${Math.round(timeline.elapsed)}s` : '';
-            meta.textContent = complete ? `done in ${elapsed}`
-                : timeline.learning ? `${elapsed} · first measured boot` : elapsed;
-        }
+        fill.style.width = `${phases.length ? (done / phases.length) * 100 : 0}%`;
     }
 
     updateStatusText(text, status) {
@@ -4406,8 +4367,6 @@ class JARVISLoadingManager {
             if (this.elements.subtitle.textContent !== newSubtitle) {
                 this.elements.subtitle.textContent = newSubtitle;
             }
-            // Its colour follows the state, as the status dot's does (loading.html).
-            this.elements.subtitle.dataset.state = status;
         }
 
         console.log(`[Status] ${text} (${status})`);
@@ -5689,7 +5648,6 @@ class JARVISLoadingManager {
             // Use more accurate subtitle based on what's actually happening
             const subtitle = backendUp ? 'PARTIAL INITIALIZATION' : 'INITIALIZATION FAILED';
             this.elements.subtitle.textContent = subtitle;
-            this.elements.subtitle.dataset.state = backendUp ? 'warning' : 'error';
         }
         if (this.elements.reactor) {
             this.elements.reactor.style.opacity = backendUp ? '0.6' : '0.3';
