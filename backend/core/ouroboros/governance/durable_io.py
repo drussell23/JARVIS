@@ -69,7 +69,10 @@ from __future__ import annotations
 import errno
 import logging
 import os
+import random
 import sys
+import tempfile
+import time
 from pathlib import Path
 from typing import Optional, Union
 
@@ -79,6 +82,7 @@ logger = logging.getLogger("Ouroboros.DurableIO")
 __all__ = [
     "DurableIOError",
     "atomic_replace",
+    "atomic_write_text",
     "flush_and_sync",
     "full_fsync_available",
     "fsync_dir",
@@ -214,19 +218,100 @@ def atomic_replace(
     tmp = Path(tmp_path)
     dst = Path(dst_path)
 
-    # (1) data before name.
-    fd = os.open(str(tmp), os.O_RDONLY)
+    # (1) data before name. Windows flushes only a handle opened for
+    # writing (FlushFileBuffers needs GENERIC_WRITE): fsync on an O_RDONLY
+    # fd there is EBADF, so every caller of this function failed on Windows
+    # (measured 2026-10-15). O_RDWR does not truncate; the data is untouched.
+    fd = os.open(str(tmp), _SYNC_OPEN_FLAGS)
     try:
         fsync_file(fd)
     finally:
         os.close(fd)
 
     # (2) atomic swap.
-    os.replace(str(tmp), str(dst))
+    _replace_tolerating_readers(tmp, dst)
 
     # (3) the name itself.
     if sync_dir:
         fsync_dir(dst.parent)
+
+
+#: Flags for re-opening a temp file only to flush it (see atomic_replace).
+_SYNC_OPEN_FLAGS = os.O_RDONLY if os.name == "posix" else (
+    os.O_RDWR | getattr(os, "O_BINARY", 0)
+)
+
+
+def _env_number(name: str, default: float, cast=float):
+    try:
+        return cast(os.environ.get(name, "") or default)
+    except (TypeError, ValueError):
+        return cast(default)
+
+
+def _is_transient_sharing_violation(exc: OSError) -> bool:
+    """Windows refuses to replace a file another process (or thread) holds
+    open without FILE_SHARE_DELETE — a reader polling the file, an indexer,
+    antivirus: ERROR_ACCESS_DENIED (5) or ERROR_SHARING_VIOLATION (32). The
+    reader lets go in milliseconds. POSIX renames over open files freely and
+    never reports this, so the retry below never runs there."""
+    return getattr(exc, "winerror", None) in (5, 32)
+
+
+def _replace_tolerating_readers(tmp: Path, dst: Path) -> None:
+    """``os.replace`` that waits out a transient Windows sharing violation.
+
+    Bounded: ``JARVIS_ATOMIC_REPLACE_ATTEMPTS`` tries with exponential,
+    jittered backoff from ``JARVIS_ATOMIC_REPLACE_BACKOFF_S``, capped at
+    ``JARVIS_ATOMIC_REPLACE_BACKOFF_MAX_S``. The last failure is raised
+    unchanged — a target held open for good is a real failure the caller
+    must see (fail-closed, §7). BLOCKS: never call from the event loop."""
+    attempts = max(1, _env_number("JARVIS_ATOMIC_REPLACE_ATTEMPTS", 8, int))
+    base = max(0.0, _env_number("JARVIS_ATOMIC_REPLACE_BACKOFF_S", 0.01))
+    cap = max(base, _env_number("JARVIS_ATOMIC_REPLACE_BACKOFF_MAX_S", 0.5))
+    for attempt in range(attempts):
+        try:
+            os.replace(str(tmp), str(dst))
+            return
+        except OSError as exc:
+            if attempt >= attempts - 1 or not _is_transient_sharing_violation(exc):
+                raise
+            delay = min(cap, base * (2 ** attempt))
+            time.sleep(delay + random.uniform(0, delay * 0.5))
+
+
+def atomic_write_text(
+    dst_path: PathLike, text: str, *, encoding: str = "utf-8",
+    sync_dir: bool = True,
+) -> None:
+    """Write ``text`` to ``dst_path`` atomically and durably. BLOCKS.
+
+    The temp file is unique per call (``mkstemp`` in the destination's
+    directory, so the rename never crosses a filesystem). A fixed
+    ``<name>.tmp`` shared by two writers — two threads, or two processes —
+    lets one writer rename the other's half-written file into place, or
+    find its own temp already renamed away. On any failure the temp is
+    removed and the error propagates."""
+    dst = Path(dst_path)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(dst.parent), prefix=f".{dst.name}.", suffix=".tmp",
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding, newline="") as fh:
+            fh.write(text)
+            flush_and_sync(fh)
+        # The data is already synced through the writing handle above, so
+        # only the swap and the directory entry remain.
+        _replace_tolerating_readers(tmp, dst)
+        if sync_dir:
+            fsync_dir(dst.parent)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 # ===========================================================================

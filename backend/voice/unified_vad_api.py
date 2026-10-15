@@ -21,7 +21,7 @@ import logging
 import numpy as np
 from typing import Literal, Optional
 
-from .vad.pipeline import get_vad_pipeline
+from .vad.pipeline import get_vad_pipeline_async
 from .audio_windowing import get_window_manager
 from .audio_format_converter import AudioFormatConverter
 
@@ -134,7 +134,7 @@ async def run_vad_pipeline(
 
     if enable_vad:
         try:
-            vad_pipeline = get_vad_pipeline()
+            vad_pipeline = await get_vad_pipeline_async()
 
             # Run VAD filtering asynchronously
             audio_array = await vad_pipeline.filter_audio_async(audio_array)
@@ -274,7 +274,7 @@ async def run_vad_pipeline_numpy(
 
     # Stage 2: VAD
     if enable_vad:
-        vad_pipeline = get_vad_pipeline()
+        vad_pipeline = await get_vad_pipeline_async()
         audio_array = await vad_pipeline.filter_audio_async(audio_array)
 
         if len(audio_array) == 0:

@@ -1871,13 +1871,21 @@ class MLEngineRegistry:
             (self._engines.get("ecapa_tdnn") and self._engines["ecapa_tdnn"].is_loaded)
         )
 
-        # At least one STT engine must be ready
-        stt_ready = (
-            (self._engines.get("whisper") and self._engines["whisper"].is_loaded) or
-            (self._engines.get("speechbrain_stt") and self._engines["speechbrain_stt"].is_loaded)
-        )
+        # At least one STT engine must be ready — of the STT engines this
+        # registry was configured to own. With Whisper and SpeechBrain STT both
+        # disabled (MLConfig), none is registered and the requirement is
+        # vacuous, exactly as ECAPA's is when ENABLE_ECAPA is off. It used to
+        # demand one anyway, so a registry whose every engine loaded reported
+        # "PARTIAL - 1/1 engines ready, Errors: []" and never set its ready
+        # event (2026-10-15).
+        stt_engines = [
+            self._engines[name]
+            for name in ("whisper", "speechbrain_stt")
+            if self._engines.get(name) is not None
+        ]
+        stt_ready = not stt_engines or any(e.is_loaded for e in stt_engines)
 
-        return ecapa_ready and stt_ready
+        return bool(ecapa_ready) and stt_ready
 
     @property
     def is_voice_unlock_ready(self) -> bool:
@@ -2254,8 +2262,15 @@ class MLEngineRegistry:
             if _absent and not _failed:
                 logger.info(f"ML engines not installed on this host: {_absent}")
             else:
-                logger.warning(f"⚠️ ML PREWARM PARTIAL - {self._status.ready_count}/{self._status.total_count} engines ready")
-                logger.warning(f"   Errors: {self._status.errors}")
+                # Name what is not ready; an empty error list alone said nothing.
+                _not_ready = {n: e.metrics.state.name for n, e in self._engines.items()
+                              if not e.is_loaded}
+                logger.warning(
+                    f"⚠️ ML PREWARM PARTIAL - {self._status.ready_count}/{self._status.total_count} "
+                    f"engines ready; not ready: {_not_ready or 'none (a required engine is unconfigured)'}"
+                )
+                if self._status.errors:
+                    logger.warning(f"   Errors: {self._status.errors}")
 
         for name, engine in self._engines.items():
             status_icon = "✅" if engine.is_loaded else "❌"

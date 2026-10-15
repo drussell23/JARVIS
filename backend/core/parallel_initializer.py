@@ -2462,34 +2462,20 @@ class ParallelInitializer:
             # 4. VAD (Voice Activity Detection) Model
             # =========================================================
             def load_vad_model():
-                """Heavy loader for VAD model.
+                """Heavy loader for VAD model (runs in the AI loader's executor).
 
-                Uses torch.hub with cache-aware source selection:
-                - source='local' when cache exists (no network, no timeout)
-                - source='github' as fallback for first download
+                Through the shared torch.hub loader: cache hit loads locally,
+                a first download needs the repo on JARVIS_TORCH_HUB_TRUSTED_REPOS.
+                The inline torch.hub.load here left trust_repo at "check", which
+                parks this thread on an input() prompt nobody can answer
+                (2026-10-15), and asked for ONNX whether or not onnxruntime
+                was installed.
                 """
                 try:
-                    import torch
-                    # Check if Silero VAD is already cached locally
-                    hub_dir = torch.hub.get_dir()
-                    local_cache = os.path.join(hub_dir, "snakers4_silero-vad_master")
-                    if os.path.isdir(local_cache):
-                        # Cache exists — load directly, no network validation
-                        source = "local"
-                        repo = local_cache
-                    else:
-                        # First download — must fetch from GitHub
-                        source = "github"
-                        repo = "snakers4/silero-vad"
+                    from backend.core.torch_hub_loader import load_silero_vad
 
-                    vad_model, utils = torch.hub.load(
-                        repo_or_dir=repo,
-                        model='silero_vad',
-                        force_reload=False,
-                        onnx=True,  # Use ONNX for speed
-                        source=source,
-                    )
-                    logger.info(f"   [BACKGROUND] VAD (Silero) loaded (source={source})")
+                    vad_model, utils = load_silero_vad()
+                    logger.info("   [BACKGROUND] VAD (Silero) loaded")
                     return {"model": vad_model, "utils": utils}
                 except Exception as e:
                     logger.warning(f"   [BACKGROUND] VAD load failed: {e}")

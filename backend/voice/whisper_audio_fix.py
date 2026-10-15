@@ -836,7 +836,7 @@ except ImportError:
 
 # VAD and windowing imports
 try:
-    from .vad import get_vad_pipeline, VADConfig, VADPipelineConfig
+    from .vad import get_vad_pipeline_async, VADConfig, VADPipelineConfig
     from .audio_windowing import get_window_manager, WindowConfig
     VAD_AVAILABLE = True
 except ImportError:
@@ -1448,11 +1448,11 @@ class WhisperAudioHandler:
 
         return await asyncio.to_thread(_write_sync)
 
-    def _get_vad_pipeline(self):
-        """Lazy-load VAD pipeline"""
+    async def _get_vad_pipeline(self):
+        """Lazy-load VAD pipeline (first load runs off the event loop)."""
         if self.vad_pipeline is None and self.vad_enabled:
             try:
-                self.vad_pipeline = get_vad_pipeline()
+                self.vad_pipeline = await get_vad_pipeline_async()
                 logger.info("✅ VAD pipeline loaded for Whisper audio handler")
             except Exception as e:
                 logger.error(f"Failed to load VAD pipeline: {e}")
@@ -1493,7 +1493,7 @@ class WhisperAudioHandler:
 
         # Step 1: VAD filtering (remove silence/noise)
         if self.vad_enabled:
-            vad_pipeline = self._get_vad_pipeline()
+            vad_pipeline = await self._get_vad_pipeline()
             if vad_pipeline:
                 try:
                     logger.info(f"🔍 Applying VAD filter ({mode} mode)...")

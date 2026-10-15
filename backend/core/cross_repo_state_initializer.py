@@ -70,6 +70,7 @@ import aiofiles.os
 # v6.4: Import distributed lock manager for cross-process locking
 from backend.core.distributed_lock_manager import get_lock_manager, DistributedLockManager
 from backend.core.robust_file_lock import RobustFileLock
+from backend.core.ouroboros.governance.durable_io import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -1856,12 +1857,17 @@ class CrossRepoStateInitializer:
 
     @staticmethod
     def _write_file_sync(path: str, data: str) -> None:
-        """v236.3: Synchronous atomic write — called inside executor.
-        Uses temp file + rename for crash safety on POSIX."""
-        tmp_path = path + ".tmp"
-        with open(tmp_path, 'w') as f:
-            f.write(data)
-        os.replace(tmp_path, path)  # Atomic on POSIX same-filesystem
+        """Synchronous atomic write — called inside the state I/O executor.
+
+        Delegates to the repo's one atomic-write primitive. The inline version
+        used a fixed ``<path>.tmp`` and a bare ``os.replace``; on Windows the
+        replace fails with WinError 5 whenever a reader (J-Prime's
+        vbia_delegate, the orchestrator's file health check) has the target
+        open at that instant, and two writers (the dual-namespace instances
+        this module guards against) would share one temp name. The primitive
+        uses a unique temp per write and waits out a transient sharing
+        violation, bounded (2026-10-15)."""
+        atomic_write_text(path, data)
 
     async def _write_json_file(self, file_path: Path, data: Any) -> None:
         """Write JSON file asynchronously."""

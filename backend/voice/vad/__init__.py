@@ -15,7 +15,7 @@ Components:
 from .base import VADBase, VADConfig, SpeechSegment
 from .webrtc_vad import WebRTCVAD
 from .silero_vad import SileroVAD, AsyncSileroVAD
-from .pipeline import VADPipeline, VADPipelineConfig, get_vad_pipeline
+from .pipeline import VADPipeline, VADPipelineConfig, get_vad_pipeline, get_vad_pipeline_async
 
 __all__ = [
     # Base classes
@@ -32,4 +32,5 @@ __all__ = [
     "VADPipeline",
     "VADPipelineConfig",
     "get_vad_pipeline",
+    "get_vad_pipeline_async",
 ]

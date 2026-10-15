@@ -3,6 +3,7 @@
 Silero VAD Implementation
 Neural-network based VAD for accurate speech detection
 """
+from __future__ import annotations
 
 import logging
 from typing import Iterator, Optional
@@ -68,13 +69,12 @@ class SileroVAD(VADBase):
         try:
             logger.info("Loading Silero VAD model from torch.hub...")
 
-            # Load model from Silero's repository
-            model, utils = torch.hub.load(
-                repo_or_dir='snakers4/silero-vad',
-                model='silero_vad',
-                force_reload=False,
-                onnx=False  # Use PyTorch model, not ONNX
-            )
+            # The shared loader declares the trust decision (no stdin
+            # prompt) and refuses to run on the event loop's thread; build
+            # this class off-loop (pipeline.get_vad_pipeline_async).
+            from backend.core.torch_hub_loader import load_silero_vad
+            # .to(device) / .eval() below need the TorchScript model.
+            model, utils = load_silero_vad(onnx=False)
 
             self.model = model.to(self.device)
             self.model.eval()

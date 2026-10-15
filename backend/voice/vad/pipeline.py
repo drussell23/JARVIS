@@ -3,8 +3,10 @@
 VAD Pipeline - Orchestrates WebRTC-VAD + Silero VAD
 Filters silence and noise before audio reaches Whisper
 """
+from __future__ import annotations
 
 import logging
+import threading
 from typing import Iterator, Optional, Literal
 import numpy as np
 import asyncio
@@ -360,11 +362,17 @@ class VADPipeline:
 
 # Global VAD pipeline instance (lazy-initialized)
 _vad_pipeline: Optional[VADPipeline] = None
+# Construction may run on an executor thread (get_vad_pipeline_async) while
+# another caller asks synchronously: one builder, never two Silero loads.
+_vad_pipeline_lock = threading.Lock()
 
 
 def get_vad_pipeline(config: Optional[VADPipelineConfig] = None) -> VADPipeline:
     """
-    Get or create global VAD pipeline instance
+    Get or create global VAD pipeline instance. BLOCKS on first call.
+
+    The first call constructs Silero, which may download it through
+    torch.hub; from a coroutine use :func:`get_vad_pipeline_async`.
 
     Args:
         config: Optional pipeline configuration (used on first call)
@@ -375,8 +383,22 @@ def get_vad_pipeline(config: Optional[VADPipelineConfig] = None) -> VADPipeline:
     global _vad_pipeline
 
     if _vad_pipeline is None:
-        if config is None:
-            config = VADPipelineConfig()
-        _vad_pipeline = VADPipeline(config)
+        with _vad_pipeline_lock:
+            if _vad_pipeline is None:
+                if config is None:
+                    config = VADPipelineConfig()
+                _vad_pipeline = VADPipeline(config)
 
     return _vad_pipeline
+
+
+async def get_vad_pipeline_async(
+    config: Optional[VADPipelineConfig] = None,
+) -> VADPipeline:
+    """:func:`get_vad_pipeline` for coroutines: the first construction (a
+    model load, possibly a download) runs off the event loop."""
+    if _vad_pipeline is not None:
+        return _vad_pipeline
+    return await asyncio.get_running_loop().run_in_executor(
+        None, get_vad_pipeline, config,
+    )
