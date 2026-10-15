@@ -232,3 +232,58 @@ def test_the_composer_addresses_the_operator_by_their_own_name(monkeypatch):
     monkeypatch.setattr(owner, "owner_name", lambda: "Ada")
     prompt = UnifiedCommandProcessor._build_compose_system_prompt()
     assert "speaking to Ada" in prompt and "Address Ada by name" in prompt
+
+
+# --------------------------------------------------------------- the calendar
+def test_the_day_asked_about_is_the_day_fetched():
+    """'tomorrow' failed fromisoformat and silently became today."""
+    from datetime import date
+    from backend.neural_mesh.agents.google_workspace_agent import resolve_day
+    wednesday = date(2026, 10, 14)
+    assert resolve_day("tomorrow", wednesday) == date(2026, 10, 15)
+    assert resolve_day("2026-10-20", wednesday) == date(2026, 10, 20)
+    assert resolve_day("Friday", wednesday) == date(2026, 10, 16)
+    assert resolve_day("wednesday", wednesday) == wednesday           # today included
+    assert resolve_day(None, wednesday) == wednesday
+
+
+def test_a_day_runs_local_midnight_to_local_midnight():
+    """Local midnight was sent stamped Z (UTC): in Pacific time 'today' ran
+    5 PM yesterday to 5 PM today."""
+    from datetime import date, datetime
+    from backend.neural_mesh.agents.google_workspace_agent import local_day_window
+    start, end = local_day_window(date(2026, 10, 14))
+    assert start.tzinfo is not None and start.hour == 0 and end.date() == date(2026, 10, 15)
+    assert start.isoformat().endswith(datetime(2026, 10, 14).astimezone().strftime("%z")[:3] + ":"
+                                      + datetime(2026, 10, 14).astimezone().strftime("%z")[3:])
+
+
+def test_the_detector_gives_the_mind_dates_to_read_not_count(monkeypatch):
+    """'friday' on a Wednesday came back as Thursday's date."""
+    from backend.core import prime_router as pr
+    from backend.core.workspace_routing_intelligence import WorkspaceIntentDetector
+    seen = {}
+
+    class _Router:
+        async def generate(self, **kw):
+            seen["prompt"] = kw["prompt"]
+            return types.SimpleNamespace(content='{"intent": "check_calendar", "entities": {"date": "2026-10-16"}, "confidence": 0.9}')
+
+    async def router():
+        return _Router()
+    monkeypatch.setattr(pr, "get_prime_router", router)
+    result = asyncio.run(WorkspaceIntentDetector().detect("what's on my calendar friday?"))
+    from datetime import date, timedelta
+    friday = date.today() + timedelta(days=(4 - date.today().weekday()) % 7)
+    assert f"Friday {friday.isoformat()}" in seen["prompt"]
+    assert result.entities == {"date": "2026-10-16"}
+
+
+def test_event_times_reach_the_composer_already_in_local_words():
+    """'12:30-07:00' was spoken as 'one thirty'."""
+    from datetime import datetime
+    from backend.api.unified_command_processor import _spoken_local_time
+    moment = datetime(2026, 10, 14, 12, 30).astimezone()
+    assert _spoken_local_time(moment.isoformat()) == "Wednesday 12:30 PM"
+    assert _spoken_local_time("2026-10-16") == "Friday (all day)"
+    assert _spoken_local_time("not a time") == "not a time"

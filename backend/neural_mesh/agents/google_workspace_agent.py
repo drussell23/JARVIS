@@ -704,6 +704,44 @@ except ImportError:
 # =============================================================================
 
 # OAuth 2.0 scopes for Google Workspace
+def resolve_day(value: Optional[str], today: Optional[date] = None) -> date:
+    """The calendar day a request names.
+
+    An ISO date is what the Mind gives (the workspace detector asks for one,
+    told today's date). The day words are the reflex when it could not
+    answer: today, tomorrow, yesterday, and a weekday name -- this host's
+    own (``calendar.day_name``) -- meaning its next occurrence, today
+    included. Anything else is today, said in the log rather than silently.
+    """
+    import calendar
+
+    today = today or date.today()
+    text = (value or "").strip().lower()
+    if not text or text == "today":
+        return today
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        pass
+    relative = {"tomorrow": 1, "yesterday": -1}
+    if text in relative:
+        return today + timedelta(days=relative[text])
+    weekdays = [name.lower() for name in calendar.day_name]
+    if text in weekdays:
+        return today + timedelta(days=(weekdays.index(text) - today.weekday()) % 7)
+    logger.info("[GoogleWorkspace] day %r not understood; using today", value)
+    return today
+
+
+def local_day_window(day: date, days: int = 1) -> Tuple[datetime, datetime]:
+    """Local midnight of *day* to local midnight *days* later, as aware
+    datetimes -- each with the offset the host's zone has on that date, so a
+    window across a daylight-saving change is still whole days."""
+    start = datetime.combine(day, datetime.min.time()).astimezone()
+    end = datetime.combine(day + timedelta(days=max(1, int(days))), datetime.min.time()).astimezone()
+    return start, end
+
+
 def _oauth_setup_command() -> str:
     """The command that connects Google: this checkout's setup script, run
     by the interpreter JARVIS itself runs on (not a bare ``python3``, which
@@ -3504,18 +3542,12 @@ class GoogleWorkspaceClient:
         if not await self._ensure_authenticated():
             return {"error": "Not authenticated", "events": []}
 
-        # Parse date
-        if date_str:
-            try:
-                start_date = datetime.fromisoformat(date_str)
-            except ValueError:
-                start_date = datetime.now()
-        else:
-            start_date = datetime.now()
-
-        # Set time bounds
-        time_min = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
-        time_max = time_min + timedelta(days=days)
+        # The day(s) asked about, from local midnight to local midnight. Two
+        # defects answered "tomorrow" with today's events: a day word failed
+        # fromisoformat and fell back to now, silently; and local midnight
+        # went to the API stamped "Z" (UTC) -- in Pacific time "today" ran
+        # 5 PM yesterday to 5 PM today.
+        time_min, time_max = local_day_window(resolve_day(date_str), days)
 
         cache_key = f"calendar:{time_min.isoformat()}:{days}"
         cached = self._get_cached(cache_key)
@@ -3543,8 +3575,9 @@ class GoogleWorkspaceClient:
         """Synchronous calendar fetch."""
         events_result = self._calendar_service.events().list(
             calendarId='primary',
-            timeMin=time_min.isoformat() + 'Z',
-            timeMax=time_max.isoformat() + 'Z',
+            # Aware datetimes: isoformat carries the offset (RFC 3339).
+            timeMin=time_min.isoformat(),
+            timeMax=time_max.isoformat(),
             singleEvents=True,
             orderBy='startTime',
         ).execute()
@@ -5714,19 +5747,13 @@ EMAIL BODY:"""
         JARVIS can still check your local calendar.
         """
         asyncio.create_task(self._narrate("Let me check your calendar."))
-        date_str = payload.get("date", "today")
+        # The one resolution of the day asked about (resolve_day), as an ISO
+        # date for every tier below -- the API reads it as that local day.
+        date_str = resolve_day(payload.get("date")).isoformat()
         days = payload.get("days", 1)
         hours_ahead = days * 24
         allow_visual_fallback = bool(payload.get("allow_visual_fallback", True))
-
-        # Handle relative dates for display
         display_date = date_str
-        if date_str:
-            date_lower = date_str.lower()
-            if date_lower == "today":
-                display_date = date.today().isoformat()
-            elif date_lower == "tomorrow":
-                display_date = (date.today() + timedelta(days=1)).isoformat()
 
         self._calendar_queries += 1
 
@@ -6307,8 +6334,12 @@ EMAIL BODY:"""
 
         elif intent == WorkspaceIntent.CHECK_CALENDAR:
             dates = metadata.get("extracted_dates", {})
+            # The day as the detector gives it -- a date from the Mind, or a
+            # day word from the reflex; resolve_day reads both. Only
+            # today/tomorrow used to pass, so a date the Mind gave was lost.
+            requested = (metadata.get("entities") or {}).get("date")
             return await self._check_calendar({
-                "date": dates.get("today") or dates.get("tomorrow"),
+                "date": requested or dates.get("today") or dates.get("tomorrow"),
                 "days": 1,
                 "deadline_monotonic": payload.get("deadline_monotonic"),
             })

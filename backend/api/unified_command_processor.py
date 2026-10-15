@@ -3059,8 +3059,10 @@ class UnifiedCommandProcessor:
                         "title": self._sanitize_for_compose(
                             str(ev.get("summary", ev.get("title", "(untitled)")))
                         )[:120],
-                        "start": str(ev.get("start", ""))[:30],
-                        "end": str(ev.get("end", ""))[:30],
+                        # Local time, written out: the composer misread raw
+                        # RFC 3339 ("12:30-07:00" spoken as "one thirty").
+                        "start": _spoken_local_time(ev.get("start")),
+                        "end": _spoken_local_time(ev.get("end")),
                         "location": self._sanitize_for_compose(
                             str(ev.get("location", ""))
                         )[:80],
@@ -10170,6 +10172,26 @@ class UnifiedCommandProcessor:
 
 # Singleton instance
 _unified_processor = None
+
+
+def _spoken_local_time(value: Any) -> str:
+    """A calendar time as it is said here: "Wednesday 12:30 PM" in the host's
+    zone, or "Wednesday (all day)" for a date. Anything unparseable passes
+    through unchanged (never a guess)."""
+    from datetime import date, datetime
+
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text[:30]
+    if "T" not in text:
+        return f"{date.fromisoformat(text[:10]).strftime('%A')} (all day)"
+    local = moment.astimezone() if moment.tzinfo else moment
+    clock = local.strftime("%I:%M %p").lstrip("0")
+    return f"{local.strftime('%A')} {clock}"
 
 
 def _google_setup_action() -> str:

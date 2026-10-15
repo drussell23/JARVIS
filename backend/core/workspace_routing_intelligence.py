@@ -452,14 +452,27 @@ class WorkspaceIntentDetector:
 
         intents = [i.value for i in WorkspaceIntent if i is not WorkspaceIntent.UNKNOWN]
         entity_names = sorted({name for p in self._patterns for name in p.entity_patterns})
+        from datetime import date, timedelta
+
+        from backend.core.host_platform import today_display
+        # The days ahead as a table the Mind reads a date from: it counted
+        # weekdays wrong ("friday" on a Wednesday became tomorrow's date).
+        horizon = int(os.environ.get("JARVIS_WORKSPACE_DAYS_AHEAD", "") or 14)
+        today = date.today()
+        days_ahead = ", ".join(
+            f"{(today + timedelta(days=n)).strftime('%A')} {(today + timedelta(days=n)).isoformat()}"
+            for n in range(max(1, horizon)))
         prompt = (
             f'Request: "{command}"\n\n'
+            f"Today is {today_display()} ({today.isoformat()}).\n"
+            f"The days from today on: {days_ahead}.\n"
             f"Workspace actions: {', '.join(intents)}.\n"
             "Which one does the request ask for -- about the user's own email, calendar, "
             "documents or contacts? Respond ONLY with JSON:\n"
             '{"intent": one action from the list, or "unknown" when the request asks for none '
             'of them, "entities": {' + ", ".join(f'"{n}": "..."' for n in entity_names)
-            + '} with only the details the request states, "confidence": 0.0 to 1.0}'
+            + '} with only the details the request states -- a day as its date, YYYY-MM-DD, '
+            '"confidence": 0.0 to 1.0}'
         )
         try:
             budget = float(os.environ.get("JARVIS_WORKSPACE_INTENT_TIMEOUT_S", "") or 8.0)
