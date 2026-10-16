@@ -271,6 +271,11 @@ class VoiceMessage:
     metadata: Dict[str, Any] = field(default_factory=dict)
     completion_event: Optional[asyncio.Event] = None
     topic: SpeechTopic = SpeechTopic.GENERAL  # v2.0: Topic for semantic grouping
+    # Whether the line is still true, asked when it reaches the speaker. A
+    # line that says a phase is starting stops being true once the phase has
+    # finished; queued behind other speech, it was heard afterwards ("Trinity
+    # activation sequence beginning" after Trinity had connected).
+    still_true: Optional[Callable[[], bool]] = None
 
     # For deduplication
     @property
@@ -588,6 +593,7 @@ class UnifiedVoiceOrchestrator:
         wait: bool = False,
         metadata: Optional[Dict[str, Any]] = None,
         topic: Optional[SpeechTopic] = None,
+        still_true: Optional[Callable[[], bool]] = None,
     ) -> bool:
         """
         Queue a message to be spoken with intelligent filtering.
@@ -599,6 +605,8 @@ class UnifiedVoiceOrchestrator:
             wait: If True, wait for message to be spoken
             metadata: Additional context
             topic: Optional speech topic for grouping (auto-inferred if not provided)
+            still_true: Asked when the line reaches the speaker; a line that
+                is no longer true there is dropped, not spoken late
 
         Returns:
             True if message was queued, False if skipped/deduplicated
@@ -623,6 +631,7 @@ class UnifiedVoiceOrchestrator:
             metadata=metadata or {},
             completion_event=completion_event,
             topic=inferred_topic,
+            still_true=still_true,
         )
 
         # Check deduplication (exact match)
@@ -820,6 +829,15 @@ class UnifiedVoiceOrchestrator:
                     if message.priority != VoicePriority.CRITICAL:
                         await asyncio.sleep(wait_time)
 
+                # Judged now, after the wait, right before it would be heard.
+                if not self._still_true(message):
+                    logger.info(f"🔇 No longer true, not spoken: {sanitize_for_log(message.text, 60)}")
+                    self._metrics.messages_skipped += 1
+                    self._queue.task_done()
+                    if message.completion_event:
+                        message.completion_event.set()
+                    continue
+
                 # Speak the message
                 await self._speak_message(message)
 
@@ -925,6 +943,18 @@ class UnifiedVoiceOrchestrator:
                     callback(message, duration)
                 except Exception as e:
                     logger.debug(f"Speak end callback error: {e}")
+
+    @staticmethod
+    def _still_true(message: VoiceMessage) -> bool:
+        """The line's own truth check; a check that fails to answer keeps the
+        line (speaking is the default, silence must be earned)."""
+        if message.still_true is None:
+            return True
+        try:
+            return bool(message.still_true())
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"still_true check failed ({exc}); speaking anyway")
+            return True
 
     async def _execute_say(self, text: str) -> None:
         """

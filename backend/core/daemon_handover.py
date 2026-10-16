@@ -28,6 +28,17 @@ its process to exit. The wait has no fixed deadline: it lasts while the old
 kernel is still talking, and only silence (no event for
 ``JARVIS_DAEMON_HANDOVER_SILENCE_S``) escalates to terminating its process
 tree. ``--restart`` uses the same handover.
+
+A restart is FOLLOWED, not lost. ``--restart`` runs its kernel detached, so
+for a while no kernel may be answering: the old one shutting down, the new
+one still booting. The launcher writes a RESTART RECORD (the detached
+runner's pid + start time, its session log) beside the kernel lock, and the
+runner clears it once its kernel holds that lock. While a record's runner is
+alive (``pending_restart``) a successor kernel is coming: a viewer whose
+kernel went away waits for it and attaches again instead of dropping to the
+prompt, and a plain launch follows the restart instead of handing the old
+kernel over a second time or booting a competing kernel (2026-10-16 00:18:
+three launches in 36 s, one boot thrown away, a viewer dropped mid-handover).
 """
 from __future__ import annotations
 
@@ -53,6 +64,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 KERNEL_LOCKS_DIR = Path.home() / ".jarvis" / "locks"
 KERNEL_LOCK_PATH = KERNEL_LOCKS_DIR / "kernel.lock"
 KERNEL_SOCKET_PATH = KERNEL_LOCKS_DIR / "kernel.sock"
+RESTART_RECORD_PATH = KERNEL_LOCKS_DIR / "restart.json"
 
 
 def kernel_holder(lock_path: Path = KERNEL_LOCK_PATH) -> Optional[int]:
@@ -69,6 +81,105 @@ def kernel_holder(lock_path: Path = KERNEL_LOCK_PATH) -> Optional[int]:
         return int(record["pid"])
     except (KeyError, TypeError, ValueError):
         return None
+
+
+# -- a restart in progress -----------------------------------------------------
+def record_restart(runner_pid: int, log: Optional[str] = None,
+                   path: Path = RESTART_RECORD_PATH) -> None:
+    """Declare that the detached runner *runner_pid* is restarting the kernel."""
+    from backend.core.ouroboros.governance.durable_io import atomic_write_text
+    from backend.core.process_identity import process_started_at
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(path, json.dumps({
+        "pid": int(runner_pid),
+        "started_at": process_started_at(runner_pid),
+        "log": log,
+        "issued_at": time.time(),
+    }))
+
+
+def pending_restart(path: Path = RESTART_RECORD_PATH) -> Optional[dict]:
+    """The restart record while its runner is alive and has not yet seen its
+    kernel take the lock; None otherwise (no record, or a dead runner's)."""
+    from backend.core.process_identity import lock_holder_alive
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) and lock_holder_alive(record) else None
+
+
+def clear_restart(runner_pid: int, path: Path = RESTART_RECORD_PATH) -> None:
+    """Withdraw *runner_pid*'s record -- never a later restart's."""
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+        if int(record.get("pid")) == int(runner_pid):
+            path.unlink()
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+
+
+def settle_restart(child, poll_s: Optional[float] = None,
+                   path: Path = RESTART_RECORD_PATH) -> None:
+    """Runner side: wait until the kernel *child* (a Popen) holds the kernel
+    lock -- or exits -- then withdraw this runner's record. BLOCKS.
+
+    Called as the child starts, while the kernel being replaced (if any) still
+    holds the lock: the restarted kernel is the next holder that is not that
+    one. Judged from the lock record alone -- the runner runs on the system
+    interpreter, which may have no psutil to walk the process tree with."""
+    poll = poll_s if poll_s is not None else settle_poll_s()
+    replaced = kernel_holder()
+    try:
+        while child.poll() is None:
+            holder = kernel_holder()
+            if holder is not None and holder != replaced:
+                return
+            time.sleep(poll)
+    finally:
+        clear_restart(os.getpid(), path)
+
+
+def daemon_live(stream_sock: Path) -> bool:
+    """Does a daemon answer on *stream_sock*? (Unlike try_bind_sync, never
+    removes the socket file: a booting kernel may be about to serve it.)"""
+    from backend.core.portable_ipc import connect_unix_sync
+    if not stream_sock.exists():
+        return False
+    try:
+        connect_unix_sync(str(stream_sock), timeout=_query_timeout_s()).close()
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def successor_expected() -> bool:
+    """Is a kernel coming that is not answering yet? A restart in progress,
+    or a live kernel lock holder whose stream is not up (early boot, or one
+    finishing its shutdown during a handover)."""
+    return pending_restart() is not None or kernel_holder() is not None
+
+
+async def await_daemon(stream_sock: Path, say: Callable[[str], None] = print) -> bool:
+    """Wait for a daemon to answer on *stream_sock* while one is expected.
+    True when one answers; False when none is coming any more."""
+    poll = settle_poll_s()
+    announced = False
+    while True:
+        if await asyncio.to_thread(daemon_live, stream_sock):
+            return True
+        if not await asyncio.to_thread(successor_expected):
+            return False
+        if not announced:
+            record = pending_restart() or {}
+            log = record.get("log")
+            say("[JARVIS] Waiting for the restarted kernel" + (f" (log: {log})" if log else "") + "...")
+            announced = True
+        await asyncio.sleep(poll)
+
+
+def settle_poll_s() -> float:
+    return max(0.05, _env_float("JARVIS_RESTART_SETTLE_POLL_S", 0.5))
 
 
 def _env_float(name: str, default: float) -> float:
@@ -369,7 +480,9 @@ async def hand_over(
 
 
 __all__ = [
-    "KERNEL_LOCK_PATH", "KERNEL_SOCKET_PATH", "REPO_ROOT", "Staleness", "code_identity",
+    "KERNEL_LOCK_PATH", "KERNEL_SOCKET_PATH", "REPO_ROOT", "RESTART_RECORD_PATH", "Staleness",
+    "await_daemon", "clear_restart", "code_identity", "daemon_live", "pending_restart",
+    "record_restart", "settle_poll_s", "settle_restart", "successor_expected",
     "daemon_status", "hand_over", "judge_staleness", "kernel_holder",
     "loaded_sources", "running_daemon_staleness", "stale_policy",
 ]

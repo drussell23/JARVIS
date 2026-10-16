@@ -82,9 +82,29 @@ if sys.platform == "win32":
     _kernel32.OpenProcess.argtypes = (_wintypes.DWORD, _wintypes.BOOL, _wintypes.DWORD)
     _kernel32.GetExitCodeProcess.argtypes = (_wintypes.HANDLE, _ctypes.POINTER(_wintypes.DWORD))
     _kernel32.CloseHandle.argtypes = (_wintypes.HANDLE,)
+    _kernel32.GetProcessTimes.argtypes = (_wintypes.HANDLE,) + (_ctypes.POINTER(_wintypes.FILETIME),) * 4
     _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     _STILL_ACTIVE = 259
     _ERROR_ACCESS_DENIED = 5
+    # FILETIME counts 100 ns ticks since 1601-01-01; the Unix epoch is this many later.
+    _FILETIME_UNIX_EPOCH = 116444736000000000
+    _FILETIME_TICKS_PER_S = 10_000_000
+
+    def _native_started_at(pid: int) -> Optional[float]:
+        """The process's creation time from the kernel (GetProcessTimes) --
+        the value psutil reports -- for interpreters without psutil (the
+        system Python the launcher and the restart runner start on)."""
+        handle = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            return None
+        try:
+            times = [_wintypes.FILETIME() for _ in range(4)]
+            if not _kernel32.GetProcessTimes(handle, *(_ctypes.byref(t) for t in times)):
+                return None
+            created = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+            return (created - _FILETIME_UNIX_EPOCH) / _FILETIME_TICKS_PER_S
+        finally:
+            _kernel32.CloseHandle(handle)
 
     def pid_alive(pid: Optional[int]) -> bool:
         """True iff ``pid`` names a running process. Never signals it."""
@@ -104,6 +124,9 @@ if sys.platform == "win32":
             _kernel32.CloseHandle(handle)
 
 else:
+
+    def _native_started_at(pid: int) -> Optional[float]:
+        return None
 
     def pid_alive(pid: Optional[int]) -> bool:
         """True iff ``pid`` names a running process. Never signals it."""
@@ -135,10 +158,23 @@ def process_started_at(pid: Optional[int]) -> Optional[float]:
         return None
     try:
         import psutil
-
+    except ImportError:
+        return _native_started_at(int(pid))
+    try:
         return float(psutil.Process(int(pid)).create_time())
-    except Exception:  # noqa: BLE001 -- gone, access denied, or no psutil
+    except Exception:  # noqa: BLE001 -- gone, access denied
         return None
+
+
+def _same_start(a: float, b: float) -> bool:
+    """Two readings of one creation time. psutil and the native reader round
+    the same kernel timestamp separately, so they may differ in the last
+    digits; a different process started at least a clock tick apart."""
+    try:
+        tolerance = float(os.environ.get("JARVIS_PROCESS_START_TOLERANCE_S", "") or 1e-3)
+    except ValueError:
+        tolerance = 1e-3
+    return abs(float(a) - float(b)) <= tolerance
 
 
 def is_same_process(pid: Optional[int], started_at: Optional[float]) -> Optional[bool]:
@@ -154,7 +190,7 @@ def is_same_process(pid: Optional[int], started_at: Optional[float]) -> Optional
     now = process_started_at(pid)
     if now is None:
         return None
-    return now == float(started_at)
+    return _same_start(now, started_at)
 
 
 def lock_holder_alive(record: dict) -> bool:
@@ -535,6 +571,43 @@ def kill_process_tree(pid: int, timeout: float = 5.0) -> bool:
         return False
 
 
+def spawn_detached(argv: List[str], **popen_kwargs):
+    """Start *argv* as a process that outlives this one AND its terminal.
+
+    POSIX: its own session (``setsid``) -- no controlling terminal, so neither
+    the terminal's Ctrl+C nor its hang-up reaches it.
+
+    Windows: ``start_new_session`` is ignored there, and a child created
+    without flags shares the launching console. Every Ctrl+C typed in that
+    window -- including one meant only to detach a viewer -- and the window
+    closing (CTRL_CLOSE_EVENT) then reached the "background" kernel
+    ``--restart`` had started. So the child gets its own hidden console
+    (CREATE_NO_WINDOW: unlike DETACHED_PROCESS, the console programs it starts
+    in turn inherit that console instead of each opening a window) in its own
+    process group (CREATE_NEW_PROCESS_GROUP), and leaves the launching
+    terminal's job (CREATE_BREAKAWAY_FROM_JOB) so a terminal that kills its
+    job on exit does not take it along -- unless the job forbids breakaway,
+    in which case the spawn is retried inside it rather than refused.
+
+    *popen_kwargs* are passed to ``subprocess.Popen``; the detaching keywords
+    are this function's to set. Returns the Popen.
+    """
+    import subprocess
+
+    popen_kwargs.pop("start_new_session", None)
+    popen_kwargs.pop("creationflags", None)
+    if sys.platform != "win32":
+        return subprocess.Popen(argv, start_new_session=True, **popen_kwargs)
+    flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+    breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+    try:
+        return subprocess.Popen(argv, creationflags=flags | breakaway, **popen_kwargs)
+    except PermissionError:
+        # ERROR_ACCESS_DENIED: the job this terminal runs in forbids breakaway.
+        logger.debug("[ProcessIdentity] job forbids breakaway; spawning inside it: %s", argv[:2])
+        return subprocess.Popen(argv, creationflags=flags, **popen_kwargs)
+
+
 def _may_signal(pid: int) -> bool:
     """The kill guard's one rule for both os.kill and psutil.Process.
 
@@ -643,5 +716,6 @@ __all__ = [
     "trinity_owned_pids",
     "pid_alive",
     "process_started_at",
+    "spawn_detached",
     "trinity_roots",
 ]

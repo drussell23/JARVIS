@@ -272,9 +272,17 @@ if session_log:
     # child writing to a file holds its prints until a block fills.
     env["PYTHONUNBUFFERED"] = "1"
     with open(session_log, "ab", buffering=0) as log:
-        result = subprocess.run(argv, cwd={_early_os.getcwd()!r}, env=env,
-                                stdin=subprocess.DEVNULL, stdout=log,
-                                stderr=subprocess.STDOUT)
+        result = subprocess.Popen(argv, cwd={_early_os.getcwd()!r}, env=env,
+                                  stdin=subprocess.DEVNULL, stdout=log,
+                                  stderr=subprocess.STDOUT)
+        try:
+            # The restart record stays until this kernel holds the kernel
+            # lock (daemon_handover): until then viewers wait for it.
+            from backend.core.daemon_handover import settle_restart
+            settle_restart(result)
+        except Exception:
+            pass
+        result.wait()
     output = ("log: " + session_log + "\\n").encode()
 else:
     result = subprocess.run(argv, cwd={_early_os.getcwd()!r}, env=env,
@@ -291,16 +299,24 @@ with open({_result_path!r}, "wb") as f:
         _early_os.close(_fd)
         _early_os.chmod(_script_path, 0o700)
 
-        # Launch completely detached (double-fork daemon pattern)
-        _proc = _sp.Popen(
+        # Launch detached from this terminal: on Windows too, where
+        # start_new_session is ignored and the "background" kernel used to
+        # share this console -- its Ctrl+C and its closing reached the kernel.
+        from backend.core.process_identity import spawn_detached as _spawn_detached
+        _proc = _spawn_detached(
             [_early_sys.executable, _script_path],
-            start_new_session=True,
             stdin=_sp.DEVNULL,
             stdout=_sp.DEVNULL,
             stderr=_sp.DEVNULL,
         )
+        if not _is_shutdown:
+            try:
+                from backend.core.daemon_handover import record_restart as _record_restart
+                _record_restart(_proc.pid, _session_log)
+            except Exception as _rr_err:  # noqa: BLE001 -- the restart itself still runs
+                _early_sys.stderr.write(f"[KERNEL] restart record unavailable: {_rr_err}\n")
 
-        # Print message and exit IMMEDIATELY
+        # Print message, then follow the restart from a terminal (else exit)
         _early_sys.stdout.write(f"\n{'='*60}\n")
         _early_sys.stdout.write(f"  JARVIS Kernel {_cmd_name.title()} Initiated\n")
         _early_sys.stdout.write(f"{'='*60}\n")
@@ -311,6 +327,14 @@ with open({_result_path!r}, "wb") as f:
             _early_sys.stdout.write(f"  Log:     {_session_log}\n")
         _early_sys.stdout.write(f"{'='*60}\n")
         _early_sys.stdout.flush()
+        if not _is_shutdown and _early_sys.stdout.isatty():
+            # A terminal watches the restart through -- the old kernel's
+            # shutdown, then the new one -- as a plain launch's viewer would
+            # (Ctrl+C detaches; the kernel keeps running). It used to return
+            # at once, and the restart looked as if it had done nothing.
+            _viewer = [a for a in _early_sys.argv[1:] if a != '--restart']
+            _early_os._exit(_sp.call(
+                [_early_sys.executable, _early_os.path.abspath(_early_sys.argv[0])] + _viewer))
         _early_os._exit(0)
 
     # Try to create own process group for additional isolation
@@ -74548,8 +74572,10 @@ class JarvisSystemKernel:
                 loop="asyncio",
             )
 
-            # Create server
-            self._backend_server = uvicorn.Server(uvicorn_config)
+            # Create server -- embedded: Ctrl+C and SIGTERM stay with the
+            # kernel's SignalDispatcher; the kernel stops it via should_exit.
+            from backend.core.embedded_uvicorn import embedded_server
+            self._backend_server = embedded_server(uvicorn_config)
 
             # Run server in background task
             self._backend_server_task = create_safe_task(
@@ -98853,10 +98879,23 @@ def main() -> int:
             from backend.core.supervisor_ipc import (
                 SOCKET_PATH as _STREAM_SOCKET, SupervisorIPC, configure_context_logging,
             )
+            from backend.core.daemon_handover import kernel_holder, pending_restart
             _ipc_probe = SupervisorIPC()
             _daemon_live = not _ipc_probe.try_bind_sync()
+            # A restart in progress owns the next kernel, and a kernel that
+            # holds the lock before its stream is up is booting: follow it --
+            # never hand it over a second time or boot a competitor.
+            _restart = pending_restart()
+            _booting = None if _daemon_live else kernel_holder()
         except Exception:
+            _restart = _booting = None
             _daemon_live = False  # IPC module unavailable — fall through to normal start
+        if _restart is not None or _booting is not None:
+            print(f"[JARVIS] A restart is in progress (log: {_restart.get('log') or 'n/a'}) "
+                  f"— following it." if _restart is not None else
+                  f"[JARVIS] Kernel PID {_booting} is starting — following it.")
+            configure_context_logging()
+            return _ipc_probe.attach()
         if _daemon_live:
             # A daemon running code this checkout no longer has is handed
             # over, not attached to (backend/core/daemon_handover.py).

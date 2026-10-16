@@ -454,7 +454,9 @@ async def serve_gateway(*, host: Optional[str] = None, port: Optional[int] = Non
     try:
         config = uvicorn.Config(build_gateway_app(), host=h, port=p,
                                 log_level=log_level, loop="asyncio", lifespan="off")
-        server = uvicorn.Server(config)
+        # Co-booted inside the soak: the harness owns the process's signals.
+        from backend.core.embedded_uvicorn import embedded_server
+        server = embedded_server(config)
     except Exception as exc:  # noqa: BLE001
         logger.warning("[ObsGateway] gateway server config failed: %s", exc)
         return

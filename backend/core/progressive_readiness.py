@@ -110,6 +110,12 @@ class ProgressiveReadiness:
     def elapsed_since_boot(self) -> float:
         return time.monotonic() - self._boot_start
 
+    def is_settled(self, node_name: str) -> bool:
+        """Has the boot phase *node_name* finished -- resolved, failed or
+        skipped? A line announcing that it is starting is untrue from then on."""
+        node = self._nodes.get(node_name)
+        return node is not None and node.status in ("resolved", "failed", "skipped")
+
     # -- DAG Node Tracking (Directive 2: State Integrity) ---------------------
 
     def mark_running(self, node_name: str, detail: str = "") -> None:

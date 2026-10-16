@@ -691,16 +691,13 @@ class AsyncSystemManager:
                 log_level=self._log_level,
                 access_log=True,
                 workers=1,  # Single worker for in-process
-                # CRITICAL: Disable signal handlers - supervisor manages signals
                 **self._extra_config,
             )
 
-            # Create server instance
-            self._server = uvicorn.Server(config)
-
-            # CRITICAL: Disable Uvicorn's built-in signal handlers
-            # The supervisor will manage SIGINT/SIGTERM
-            self._server.install_signal_handlers = lambda: None
+            # Create server instance -- embedded: the supervisor owns
+            # SIGINT/SIGTERM (backend/core/embedded_uvicorn.py).
+            from backend.core.embedded_uvicorn import embedded_server
+            self._server = embedded_server(config)
 
             # Start server in background task
             self._server_task = asyncio.create_task(

@@ -410,21 +410,53 @@ class SupervisorIPC:
         """
         Watch the running daemon from this process until it exits or the
         user presses Ctrl+C. The blocking entry point for a launch that found
-        a daemon: it declares the process a viewer first (``viewer_signals``,
-        CLI-only mode), so Ctrl+C detaches instead of running the kernel's
-        shutdown machinery, and exiting cleans up nothing it does not own.
+        a daemon -- or a restart in progress: it declares the process a viewer
+        first (``viewer_signals``, CLI-only mode), so Ctrl+C detaches instead
+        of running the kernel's shutdown machinery, and exiting cleans up
+        nothing it does not own.
         """
         from backend.core.resilience.graceful_shutdown import set_cli_only_mode
         set_cli_only_mode(True)   # a viewer started nothing, so it cleans up nothing
         with viewer_signals():
             try:
-                outcome = asyncio.run(self.attach_as_client())
+                outcome = asyncio.run(self.follow())
             except KeyboardInterrupt:
                 outcome = "stopped"
         if outcome == "stopped":
             print(f"\n{_DIM}[JARVIS] Detached — the daemon keeps running.{_RESET}"
                   if self._is_tty else "[JARVIS] Detached — the daemon keeps running.")
         return 0
+
+    async def follow(self) -> str:
+        """
+        Watch the daemon, and the kernel that replaces it.
+
+        A kernel that goes away during a restart (handed over, then its
+        successor booting) is not the end of the watch: while a successor is
+        expected (``daemon_handover.successor_expected``) the viewer waits for
+        it to answer and attaches again. Returns how the watch finally ended
+        (see ``relay``); ``closed`` when no daemon answered and none is coming.
+        """
+        from backend.core.daemon_handover import (
+            settle_poll_s, await_daemon, successor_expected,
+        )
+        watched = False
+        while True:
+            if not await await_daemon(SOCKET_PATH):
+                if not watched:
+                    print("[JARVIS] No kernel answered, and none is starting — "
+                          "its session log says why.", flush=True)
+                return "closed"
+            if watched:
+                print(f"{_CYAN}[JARVIS]{_RESET} Following the new kernel." if self._is_tty
+                      else "[JARVIS] Following the new kernel.", flush=True)
+            outcome = await self.attach_as_client()
+            watched = True
+            if outcome == "stopped":
+                return outcome
+            if not await asyncio.to_thread(successor_expected):
+                return outcome
+            await asyncio.sleep(settle_poll_s())  # the old kernel is still letting go
 
     async def attach_as_client(self) -> str:
         """

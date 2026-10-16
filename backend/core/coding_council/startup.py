@@ -696,7 +696,10 @@ async def initialize_coding_council_startup(
         log.info("=" * 60)
 
         # v79.1: Use StartupAnnouncementCoordinator for priority-based announcements
-        # This prevents overlapping announcements with other systems
+        # This prevents overlapping announcements with other systems. Its
+        # decision holds for the whole startup: a council that deferred to a
+        # higher-priority announcer does not speak when it comes online either.
+        owns_startup_voice = True
         if CODING_COUNCIL_VOICE_ANNOUNCE:
             try:
                 from ..startup_announcement_coordinator import (
@@ -716,6 +719,7 @@ async def initialize_coding_council_startup(
                         "timestamp": start_time,
                     }
                 )
+                owns_startup_voice = bool(should_announce)
 
                 if should_announce and narrator:
                     # We won the announcement - speak initialization message
@@ -796,24 +800,15 @@ async def initialize_coding_council_startup(
         log.info(f"  Cross-Repo: {os.getenv('CODING_COUNCIL_CROSS_REPO', 'true')}")
         log.info("=" * 60)
 
-        # v79.1: Voice success using voice announcer or coordinator
-        if CODING_COUNCIL_VOICE_ANNOUNCE:
+        # Coming online is not an evolution: it was announced through the
+        # evolution-COMPLETE path ("Code evolution successful." at every boot,
+        # with nothing evolved) and past the coordinator's decision above.
+        if CODING_COUNCIL_VOICE_ANNOUNCE and owns_startup_voice and narrator:
             try:
-                # Try v79.1 voice announcer first (has circuit breaker, async, etc.)
-                if _voice_announcer:
-                    await _voice_announcer.announce_completion(
-                        task_id="startup",
-                        success=True,
-                        files_modified=0,
-                        execution_time_ms=duration * 1000,
-                        error=None,
-                    )
-                elif narrator:
-                    # Fallback to narrator
-                    await narrator.speak(
-                        "Coding Council online. Self-evolution capabilities active.",
-                        wait=False
-                    )
+                await narrator.speak(
+                    "Coding Council online. Self-evolution capabilities active.",
+                    wait=False
+                )
             except Exception as e:
                 log.debug(f"[v79.1] Voice success announcement skipped: {e}")
 

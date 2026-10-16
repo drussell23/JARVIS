@@ -574,17 +574,14 @@ def arm(kernel_pid: int) -> Optional[Any]:
         from backend.core.daemon_handover import REPO_ROOT
         from backend.core.host_platform import log_dir
         stamp = f"{datetime.now():%Y%m%d-%H%M%S}"
+        from backend.core.process_identity import spawn_detached
         out = (Path(log_dir()) / f"memory-guard-{stamp}.log").open("ab")
-        kwargs: Dict[str, Any] = {"start_new_session": True}
-        if sys.platform == "win32":
-            kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP
-                      | getattr(subprocess, "CREATE_NO_WINDOW", 0)}
-        proc = subprocess.Popen(
+        proc = spawn_detached(
             [sys.executable, "-m", "backend.core.memory_guard", "watch",
              "--pid", str(kernel_pid), "--once",
              "--journal", str(Path(log_dir()) / f"memory-guard-{stamp}.jsonl")],
             cwd=str(REPO_ROOT), stdin=subprocess.DEVNULL, stdout=out,
-            stderr=subprocess.STDOUT, **kwargs,
+            stderr=subprocess.STDOUT,
         )
         out.close()  # the child holds its own handle
         _armed[kernel_pid] = proc

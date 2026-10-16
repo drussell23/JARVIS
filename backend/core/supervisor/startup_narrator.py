@@ -1390,6 +1390,15 @@ SLOW_STARTUP_MESSAGES: List[str] = [
 ]
 
 
+def _phase_running(node_name: str) -> Callable[[], bool]:
+    """A "phase is starting" line's truth: until the boot DAG node
+    *node_name* has finished (backend/core/progressive_readiness)."""
+    def still_true() -> bool:
+        from backend.core.progressive_readiness import get_readiness
+        return not get_readiness().is_settled(node_name)
+    return still_true
+
+
 class IntelligentStartupNarrator:
     """
     Intelligent narrator that provides phase-aware voice feedback during startup.
@@ -1524,13 +1533,20 @@ class IntelligentStartupNarrator:
         }
         return mapping.get(priority, VoicePriority.MEDIUM)
 
-    async def _speak(self, text: str, priority: NarrationPriority = NarrationPriority.MEDIUM) -> None:
+    async def _speak(
+        self,
+        text: str,
+        priority: NarrationPriority = NarrationPriority.MEDIUM,
+        still_true: Optional[Callable[[], bool]] = None,
+    ) -> None:
         """
         Speak text through unified voice orchestrator.
 
         Args:
             text: Text to speak
             priority: Priority level (affects whether we wait or skip)
+            still_true: Asked when the line reaches the speaker (see
+                VoiceMessage.still_true); None for a line that stays true
         """
         # Check minimum interval (unless critical) - orchestrator also has rate limiting
         # but we do a local check to avoid queuing too many messages
@@ -1569,6 +1585,7 @@ class IntelligentStartupNarrator:
                 source=VoiceSource.STARTUP,
                 wait=False,
                 topic=SpeechTopic.STARTUP,  # v3.0: Use startup topic for cooldowns
+                still_true=still_true,
             )
 
     async def _queue_narration(
@@ -2474,7 +2491,7 @@ class IntelligentStartupNarrator:
         text = self._get_phase_message(StartupPhase.TRINITY_INIT, "start")
         if not text:
             text = "Initiating Project Trinity. Distributed cognitive architecture coming online."
-        await self._speak(text, NarrationPriority.HIGH)
+        await self._speak(text, NarrationPriority.HIGH, still_true=_phase_running("trinity"))
         logger.info("[Narrator] Trinity initialization announced")
 
     async def announce_trinity_body(self, mode: str = "start") -> None:
