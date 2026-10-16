@@ -415,8 +415,10 @@ class SupervisorIPC:
         of running the kernel's shutdown machinery, and exiting cleans up
         nothing it does not own.
         """
+        from backend.core.process_roles import VIEWER, declare_role
         from backend.core.resilience.graceful_shutdown import set_cli_only_mode
         set_cli_only_mode(True)   # a viewer started nothing, so it cleans up nothing
+        declare_role(VIEWER)      # ...and no kernel's cleanup takes it for an orphan
         with viewer_signals():
             try:
                 outcome = asyncio.run(self.follow())

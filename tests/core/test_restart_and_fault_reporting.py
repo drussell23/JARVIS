@@ -148,6 +148,7 @@ def _runner(session_log, argv, result_path):
     template = re.search(r"_script_content = (f'''.*?''')\n", src, re.S).group(1)
     fake_sys = type("S", (), {"executable": sys.executable, "argv": argv})
     return eval(template, {"_reexec_marker": "_JARVIS_RESTART_REEXEC", "_early_sys": fake_sys,
+                           "__file__": str(Path("unified_supervisor.py").resolve()),
                            "_early_os": os, "_result_path": str(result_path),
                            "_session_log": None if session_log is None else str(session_log)})
 

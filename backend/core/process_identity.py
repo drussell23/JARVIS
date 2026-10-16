@@ -608,18 +608,38 @@ def spawn_detached(argv: List[str], **popen_kwargs):
         return subprocess.Popen(argv, creationflags=flags, **popen_kwargs)
 
 
-def _may_signal(pid: int) -> bool:
-    """The kill guard's one rule for both os.kill and psutil.Process.
+def _refusal(pid: int) -> Optional[str]:
+    """The kill guard's one rule for both os.kill and psutil.Process: why
+    *pid* may not be signalled, or None when it may.
 
     A member of a tree being stopped as a unit; a process that no longer
     exists (the real call reports that, the guard must not call it foreign);
+    never a live client of the kernel -- a viewer, a control command, a launch
+    -- nor one of its launchers (backend/core/process_roles): those match
+    every sweep's idea of "a JARVIS process" and are nobody's orphans;
     otherwise structural ownership.
     """
     if pid in _authorized_tree.get():
-        return True
+        return None
     if not pid_alive(pid):
-        return True
-    return owned_by_trinity(pid)
+        return None
+    try:
+        from backend.core.process_roles import client_protecting
+        client = client_protecting(pid)
+    except Exception:  # noqa: BLE001 -- no record readable: ownership decides
+        client = None
+    if client is not None:
+        role = client.get("role")
+        return (f"a live JARVIS {role}" if client.get("pid") == pid
+                else f"the launcher of a live JARVIS {role} (PID {client.get('pid')})")
+    if not owned_by_trinity(pid):
+        return "not a Trinity-owned process"
+    return None
+
+
+def _may_signal(pid: int) -> bool:
+    """Whether the kill guard lets *pid* be signalled (see ``_refusal``)."""
+    return _refusal(pid) is None
 
 
 def may_signal(pid: int) -> bool:
@@ -631,7 +651,13 @@ def may_signal(pid: int) -> bool:
     the process table. Always True where the guard is off."""
     if not kill_guard_enabled() or pid in _authorized_tree.get():
         return True
-    return pid in trinity_owned_pids()
+    if pid not in trinity_owned_pids():
+        return False
+    try:
+        from backend.core.process_roles import client_protecting
+        return client_protecting(pid) is None   # read live: a client declares mid-boot
+    except Exception:  # noqa: BLE001
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -665,10 +691,10 @@ def install_kill_guard() -> bool:
                         raise ProcessLookupError(3, "No such process")
                     return None
                 return real_kill(pid, sig)
-            if not _may_signal(pid):
+            refusal = _refusal(pid)
+            if refusal is not None:
                 logger.warning(
-                    "[KillGuard] refused signal %s to %s: not a Trinity-owned process",
-                    sig, _describe(pid),
+                    "[KillGuard] refused signal %s to %s: %s", sig, _describe(pid), refusal,
                 )
                 raise PermissionError(1, "Operation not permitted (JARVIS kill guard)")
             return real_kill(pid, sig)
@@ -683,10 +709,11 @@ def install_kill_guard() -> bool:
                 real = getattr(psutil.Process, method_name)
 
                 def guarded(self, *args, **kwargs):  # type: ignore[no-untyped-def]
-                    if not _may_signal(self.pid):
+                    refusal = _refusal(self.pid)
+                    if refusal is not None:
                         logger.warning(
-                            "[KillGuard] refused %s on %s: not a Trinity-owned process",
-                            method_name, _describe(self.pid),
+                            "[KillGuard] refused %s on %s: %s",
+                            method_name, _describe(self.pid), refusal,
                         )
                         raise psutil.AccessDenied(self.pid, msg="JARVIS kill guard")
                     return real(self, *args, **kwargs)

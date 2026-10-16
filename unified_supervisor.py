@@ -239,6 +239,11 @@ if _is_cli_mode:
         _script_content = f'''#!/usr/bin/env python3
 import os, sys, signal, subprocess, time
 
+# This script runs from the temp directory: the checkout's packages are
+# importable only through its root (without it the .env load and the restart
+# record's settling below failed silently, and the record outlived the restart).
+sys.path.insert(0, {_early_os.path.dirname(_early_os.path.abspath(__file__))!r})
+
 # Phase 0 (2026-07-19): centralized .env — loaded ONCE, at the highest
 # bootstrap point, BEFORE any heavy ML/vision import. override=False
 # so the real environment / launchd plist ALWAYS wins over the file.
@@ -515,6 +520,19 @@ if not (_ANSWER_AND_EXIT_FLAGS & set(_sys.argv[1:])):
         start_session_log("supervisor")
     except Exception as _sl_err:  # a missing log never stops the kernel
         print(f"[KERNEL] session log unavailable: {_sl_err}")
+
+# This process declares what it is (backend/core/process_roles): a launch that
+# has yet to become the kernel or a viewer, or a command that answers and
+# exits. Until then a booting kernel's cleanup took it for an orphan.
+try:
+    from backend.core import process_roles as _process_roles
+    _process_roles.declare_role(
+        _process_roles.CONTROL if _ANSWER_AND_EXIT_FLAGS & set(_sys.argv[1:])
+        else _process_roles.LAUNCHING
+    )
+    del _process_roles
+except Exception:  # noqa: BLE001 -- a missing record never stops a launch
+    pass
 
 # Clean up temporary imports
 del _os, _sys, _Path, _ensure_venv_python, _venv_python_candidates
@@ -6397,8 +6415,10 @@ class IntelligentKernelTakeover:
         # may be a sibling owned elsewhere (J-Prime's llama-server on :8000, a
         # WSL relay on :8080). Only structurally-owned processes are cleaned.
         try:
-            from backend.core.process_identity import owned_by_trinity
-            orphans = [o for o in orphans if owned_by_trinity(o.pid)]
+            # may_signal: structurally owned AND not a live client of a
+            # kernel (a viewer, a control command, a launch -- process_roles).
+            from backend.core.process_identity import may_signal
+            orphans = [o for o in orphans if may_signal(o.pid)]
         except ImportError:
             pass
         # A sibling that is serving is adopted by this boot (trinity_siblings
@@ -21637,17 +21657,18 @@ class ParallelProcessCleaner:
 
         # The patterns are substrings ("jarvis"), which every process under a
         # home directory named Jarvis matches. Identity is structural: keep
-        # only what process_identity says this kernel owns.
+        # only what process_identity says this kernel may stop -- owned, and
+        # not a live client of a kernel (process_roles).
         try:
-            from backend.core.process_identity import owned_by_trinity
+            from backend.core.process_identity import may_signal
         except ImportError:
             return discovered
-        foreign = [pid for pid in discovered if not owned_by_trinity(pid)]
+        foreign = [pid for pid in discovered if not may_signal(pid)]
         for pid in foreign:
             discovered.pop(pid, None)
         if foreign:
             self.logger.debug(
-                f"[ProcessCleaner] ignored {len(foreign)} pattern match(es) not owned by Trinity"
+                f"[ProcessCleaner] ignored {len(foreign)} pattern match(es) Trinity may not stop"
             )
 
         return discovered
@@ -55836,8 +55857,8 @@ class ComprehensiveZombieCleanup:
         # Heuristic "zombies" are only candidates; terminate only what this
         # kernel structurally owns (backend/core/process_identity.py).
         try:
-            from backend.core.process_identity import owned_by_trinity
-            zombies = {pid: info for pid, info in zombies.items() if owned_by_trinity(pid)}
+            from backend.core.process_identity import may_signal
+            zombies = {pid: info for pid, info in zombies.items() if may_signal(pid)}
             # A serving sibling is adopted by this boot, not a zombie.
             adopted = await _serving_sibling_pids()
             zombies = {pid: info for pid, info in zombies.items() if pid not in adopted}
@@ -72650,6 +72671,10 @@ class JarvisSystemKernel:
 
             # Log takeover success details
             self.logger.success(f"[Kernel] Startup lock acquired (method: {takeover_result.takeover_method})")
+            # Now the kernel, no longer a client: a later kernel's takeover may
+            # stop this one if it outlives its lock (backend/core/process_roles).
+            from backend.core.process_roles import KERNEL as _KERNEL_ROLE, declare_role
+            await asyncio.to_thread(declare_role, _KERNEL_ROLE)
 
             # The memory guard: an out-of-process watcher that stops this
             # kernel before host memory takes the desktop down (a wedged
